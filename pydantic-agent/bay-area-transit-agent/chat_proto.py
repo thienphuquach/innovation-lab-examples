@@ -32,15 +32,19 @@ from cards import (
     extract_text,
     intake_form_card,
     parse_selection,
+    route_carousel_card,
+    routing_error_card,
     send_card,
     send_text,
     terminal_info_card,
 )
 from clients.geocode import resolve_place
+from clients.transitland import RoutingError, plan
 from models import depart_option_to_iso, new_trip, validate_trip_texts
 from payment import confirm_payment_via_text, request_payment
 from session_state import (
     INTAKE,
+    SHOWING_DETAIL,
     SHOWING_ROUTES,
     check_new_window_and_reset,
     get_state,
@@ -228,19 +232,101 @@ async def _apply_place_pick(
 
 
 async def _finalize_trip(ctx: Context, sender: str, state: dict[str, Any]) -> None:
-    """Promote a fully-geocoded pending trip and hand off to Stage 3."""
-    state["trip"] = state.pop("pending_trip", None)
+    """Promote a fully-geocoded pending trip and run the route search (Stage 3)."""
+    state["trip"] = state.get("pending_trip")
     state["pending_trip"] = None
     state["stage"] = SHOWING_ROUTES
     save_state(ctx, sender, state)
-    # Stage 3 (route search carousel) replaces this stub in its own commit.
-    trip = state["trip"]
-    await send_text(
-        ctx,
-        sender,
-        f"Got it: {trip['origin_text']} -> {trip['destination_text']}. "
-        "Searching for routes... (route results land in the next build stage).",
+    await _search_routes(ctx, sender, state)
+
+
+# ── Stage 3 - route search (carousel) ────────────────────────────────────────
+async def _search_routes(ctx: Context, sender: str, state: dict[str, Any]) -> None:
+    """Call Transitland and render the itinerary carousel (cached for Back)."""
+    trip = state.get("trip")
+    if not trip or not trip.get("origin_coords") or not trip.get("destination_coords"):
+        await start_intake(ctx, sender, state)
+        return
+
+    try:
+        plan_obj = await plan(
+            trip["origin_coords"], trip["destination_coords"], trip.get("depart_time")
+        )
+    except RoutingError as exc:
+        ctx.logger.error(f"[stage3] routing error: {exc}")
+        await send_card(
+            ctx,
+            sender,
+            "The trip planner didn't respond just now.",
+            routing_error_card(),
+        )
+        return
+
+    itineraries = plan_obj.get("itineraries") or []
+    if not itineraries:
+        await send_card(
+            ctx,
+            sender,
+            "No routes found for that time.",
+            terminal_info_card(
+                "No routes found",
+                "I couldn't find any transit for that time. Try a different departure time.",
+            ),
+        )
+        await start_intake(ctx, sender, state)
+        return
+
+    state["last_itineraries"] = plan_obj  # cached so Back needs no re-fetch
+    state["stage"] = SHOWING_ROUTES
+    save_state(ctx, sender, state)
+
+    n = len(itineraries)
+    lead = (
+        "Here's a walking route." if n == 1 and not _has_transit(itineraries[0])
+        else f"Found {n} option{'s' if n != 1 else ''}."
     )
+    await send_card(
+        ctx, sender, lead, route_carousel_card(itineraries, trip.get("priority", "fastest"))
+    )
+
+
+def _has_transit(itinerary: dict[str, Any]) -> bool:
+    return any(leg.get("transitLeg") for leg in itinerary.get("legs", []))
+
+
+async def _handle_routes(ctx: Context, sender: str, text: str, state: dict[str, Any]) -> None:
+    """Stage 3 dispatch: pick a route, retry, or treat free text as a new trip."""
+    selection = parse_selection(text)
+    action = selection.get("action")
+
+    if action == "retry_routing":
+        await _search_routes(ctx, sender, state)
+        return
+
+    if action == "pick_route":
+        try:
+            idx = int(selection["route_index"])
+        except (KeyError, TypeError, ValueError):
+            await _search_routes(ctx, sender, state)
+            return
+        itineraries = (state.get("last_itineraries") or {}).get("itineraries") or []
+        if not 0 <= idx < len(itineraries):
+            await _search_routes(ctx, sender, state)
+            return
+        state["selected_route_id"] = str(idx)
+        state["stage"] = SHOWING_DETAIL
+        save_state(ctx, sender, state)
+        # Stage 4 (route+fare detail) replaces this stub in its own commit.
+        await send_text(
+            ctx,
+            sender,
+            "Pulling up that route's fares and live status... "
+            "(fare detail lands in the next build stage).",
+        )
+        return
+
+    # Free text at the carousel: treat as a new/overridden trip request.
+    await _handle_intake(ctx, sender, text, state)
 
 
 # ── Paid-stage dispatch (Stages 2-6) ─────────────────────────────────────────
@@ -254,8 +340,10 @@ async def _dispatch_paid(ctx: Context, sender: str, text: str, state: dict[str, 
     stage = state.get("stage", INTAKE)
     if stage == INTAKE:
         await _handle_intake(ctx, sender, text, state)
+    elif stage == SHOWING_ROUTES:
+        await _handle_routes(ctx, sender, text, state)
     else:
-        # Stages 3+ not yet wired; restart intake so the flow stays usable.
+        # Stages 4+ not yet wired; restart intake so the flow stays usable.
         await start_intake(ctx, sender, state)
 
 

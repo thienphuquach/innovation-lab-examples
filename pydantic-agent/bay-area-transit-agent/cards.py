@@ -26,9 +26,13 @@ from uagents_core.contrib.protocols.chat import (
     TextContent,
 )
 
-from models import GeocodeCandidate
+from clients.transitland import transit_legs
+from models import GeocodeCandidate, epoch_ms_to_clock, fmt_duration
 
 CARD_PROTOCOL_VERSION = "1"
+
+# Wait longer than this (seconds) earns a distinct warning badge on a route.
+LONG_WAIT_THRESHOLD_S = 20 * 60
 
 
 # ── Wire helpers ─────────────────────────────────────────────────────────────
@@ -198,3 +202,78 @@ def terminal_info_card(title: str, body: str) -> dict[str, str]:
         "summary_rows": [{"label": "", "value": body}],
     }
     return build_card_metadata("detail", payload, is_terminal=True)
+
+
+# ── Stage 3 - route search carousel ──────────────────────────────────────────
+def _route_title(itinerary: dict[str, Any]) -> str:
+    legs = transit_legs(itinerary)
+    if not legs:
+        return "Walk the whole way"
+    names = [
+        (leg.get("routeShortName") or leg.get("routeLongName") or leg.get("agencyName") or "?")
+        for leg in legs
+    ]
+    return " → ".join(names)
+
+
+def route_carousel_card(itineraries: list[dict[str, Any]], priority: str) -> dict[str, str]:
+    """Build the Stage 3 ``carousel`` from Transitland itineraries.
+
+    Badges: Fastest (min duration), Fewest transfers (min transfers, when distinct),
+    and a distinct ``warning`` badge for any itinerary with a long wait (sparse
+    service) so it never looks like a normal short-wait option.
+    """
+    durations = [it.get("duration", 0) or 0 for it in itineraries]
+    transfers = [it.get("transfers", 0) or 0 for it in itineraries]
+    fastest_idx = durations.index(min(durations)) if durations else -1
+    fewest_idx = transfers.index(min(transfers)) if transfers else -1
+
+    items = []
+    for i, it in enumerate(itineraries):
+        badges = []
+        if i == fastest_idx:
+            badges.append({"label": "Fastest", "variant": "success"})
+        if i == fewest_idx and fewest_idx != fastest_idx:
+            badges.append({"label": "Fewest transfers", "variant": "info"})
+        wait = it.get("waitingTime", 0) or 0
+        if wait >= LONG_WAIT_THRESHOLD_S:
+            badges.append({"label": f"Long wait — {fmt_duration(wait)}", "variant": "warning"})
+
+        n = it.get("transfers", 0) or 0
+        subtitle = (
+            f"{fmt_duration(it.get('duration'))} · {n} transfer{'s' if n != 1 else ''} · "
+            f"{epoch_ms_to_clock(it.get('startTime'))}–{epoch_ms_to_clock(it.get('endTime'))}"
+        )
+        items.append(
+            {
+                "id": f"route_{i}",
+                "title": _route_title(it),
+                "subtitle": subtitle,
+                "badges": badges,
+                "primary_cta": {
+                    "label": "View & fares",
+                    "selection": {"action": "pick_route", "route_index": i},
+                },
+            }
+        )
+
+    payload = {
+        "title": "Route options",
+        "subtitle": f"Optimizing for {priority.replace('_', ' ')}. Tap one for fares & live status.",
+        "items": items,
+    }
+    return build_card_metadata("carousel", payload)
+
+
+def routing_error_card() -> dict[str, str]:
+    """A ``detail`` card with a Try-again CTA when routing fails."""
+    payload = {
+        "title": "Couldn't reach the trip planner",
+        "summary_rows": [
+            {"label": "", "value": "The routing service didn't respond. Want to try again?"}
+        ],
+        "ctas": [
+            {"label": "Try again", "selection": {"action": "retry_routing"}, "primary": True}
+        ],
+    }
+    return build_card_metadata("detail", payload)

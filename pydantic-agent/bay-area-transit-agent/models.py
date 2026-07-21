@@ -40,6 +40,28 @@ def now_local() -> datetime:
     return datetime.now(BAY_AREA_TZ)
 
 
+def fmt_duration(seconds: float | int | None) -> str:
+    """Human duration, e.g. 5046 -> '1h 24m', 540 -> '9m', 40 -> '<1m'."""
+    if not seconds or seconds < 0:
+        return "0m"
+    total_min = int(seconds // 60)
+    h, m = divmod(total_min, 60)
+    if h and m:
+        return f"{h}h {m}m"
+    if h:
+        return f"{h}h"
+    if m:
+        return f"{m}m"
+    return "<1m"
+
+
+def epoch_ms_to_clock(ms: int | float | None) -> str:
+    """Millisecond epoch -> local 'HH:MM' clock string (Bay Area tz)."""
+    if not ms:
+        return "--:--"
+    return datetime.fromtimestamp(ms / 1000, BAY_AREA_TZ).strftime("%H:%M")
+
+
 def depart_option_to_iso(option: str | None, *, now: datetime | None = None) -> str | None:
     """Map a form ``depart_option`` to an absolute ISO local timestamp.
 
