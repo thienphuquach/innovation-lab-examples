@@ -14,10 +14,18 @@ ASI:One is reached through Pydantic AI's OpenAI-compatible model, exactly as in
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent
+from pydantic_ai import (
+    Agent,
+    DeferredToolRequests,
+    DeferredToolResults,
+    RunContext,
+    ToolDenied,
+)
+from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
 from pydantic_ai.models import Model
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
@@ -93,3 +101,98 @@ async def extract_trip(text: str, *, model: Model | None = None) -> TripExtracti
     if out.priority not in PRIORITIES:
         out.priority = "fastest"
     return out
+
+
+# ── message_history (de)serialization ────────────────────────────────────────
+# Pydantic AI ModelMessages need the type adapter, not plain json.dumps
+# (research-notes.md §5). These back the session's ``message_history`` field.
+def dump_history(messages: list[ModelMessage]) -> str:
+    return ModelMessagesTypeAdapter.dump_json(messages).decode("utf-8")
+
+
+def load_history(history_json: str) -> list[ModelMessage]:
+    return list(ModelMessagesTypeAdapter.validate_json(history_json))
+
+
+# ── Stage 5 - finalize gate (deferred tool, requires_approval) ───────────────
+@dataclass
+class FinalizeDeps:
+    """Injected so the gated tool can flip a confirmation flag on approval."""
+
+    confirmed: bool = False
+
+
+@dataclass
+class FinalizeStart:
+    """Outcome of the first finalize run (the tool defers before it runs)."""
+
+    deferred: bool
+    history_json: str
+    tool_call_id: str | None = None
+
+
+_finalize_agent: Agent[FinalizeDeps, str | DeferredToolRequests] = Agent(
+    _DEFAULT_MODEL,
+    deps_type=FinalizeDeps,
+    output_type=[str, DeferredToolRequests],
+    system_prompt=(
+        "You finalize a Bay Area transit itinerary the user has already chosen by "
+        "calling the finalize_itinerary tool exactly once. After it returns, reply "
+        "with a one-line confirmation. Never invent trip details."
+    ),
+)
+
+
+@_finalize_agent.tool(requires_approval=True)
+async def finalize_itinerary(ctx: RunContext[FinalizeDeps], summary: str) -> str:
+    """Commit the chosen itinerary (no external side effect - payment happened at Stage 0).
+
+    Gated by ``requires_approval=True``: the body only runs after an explicit
+    approval, which is exactly the Review card's Confirm action.
+    """
+    ctx.deps.confirmed = True
+    return f"Itinerary confirmed: {summary}"
+
+
+async def start_finalize(summary: str, *, model: Model | None = None) -> FinalizeStart:
+    """First finalize run: the model calls the gated tool, which defers.
+
+    Returns the serialized history + the pending tool-call id so the caller can
+    resume with the user's Confirm/Cancel on the next chat turn.
+    """
+    result = await _finalize_agent.run(
+        f"Finalize this itinerary: {summary}", deps=FinalizeDeps(), model=model
+    )
+    history_json = dump_history(result.all_messages())
+    output = result.output
+    if isinstance(output, DeferredToolRequests) and output.approvals:
+        return FinalizeStart(
+            deferred=True,
+            history_json=history_json,
+            tool_call_id=output.approvals[0].tool_call_id,
+        )
+    return FinalizeStart(deferred=False, history_json=history_json)
+
+
+async def resume_finalize(
+    *,
+    history_json: str,
+    tool_call_id: str,
+    approved: bool,
+    denial_message: str = "The user cancelled before confirming.",
+    model: Model | None = None,
+) -> bool:
+    """Resume the deferred finalize with the user's decision.
+
+    Returns ``True`` iff the approval ran the gated tool body.
+    """
+    deps = FinalizeDeps()
+    results = DeferredToolResults()
+    results.approvals[tool_call_id] = True if approved else ToolDenied(denial_message)
+    await _finalize_agent.run(
+        message_history=load_history(history_json),
+        deferred_tool_results=results,
+        deps=deps,
+        model=model,
+    )
+    return deps.confirmed

@@ -26,12 +26,14 @@ from uagents_core.contrib.protocols.chat import (
     chat_protocol_spec,
 )
 
-from ai import extract_trip
+from ai import extract_trip, resume_finalize, start_finalize
 from cards import (
     disambiguation_carousel_card,
     extract_text,
+    final_itinerary_card,
     intake_form_card,
     parse_selection,
+    review_card,
     route_carousel_card,
     route_detail_card,
     routing_error_card,
@@ -47,10 +49,12 @@ from models import depart_option_to_iso, new_trip, validate_trip_texts
 from payment import confirm_payment_via_text, request_payment
 from session_state import (
     AWAITING_CONFIRM,
+    DONE,
     INTAKE,
     SHOWING_DETAIL,
     SHOWING_ROUTES,
     check_new_window_and_reset,
+    clear_trip_state,
     get_state,
     save_state,
 )
@@ -397,14 +401,7 @@ async def _handle_detail(ctx: Context, sender: str, text: str, state: dict[str, 
         return
 
     if action == "continue_review":
-        state["stage"] = AWAITING_CONFIRM
-        save_state(ctx, sender, state)
-        # Stage 5 (review + deferred-tool gate) replaces this stub in its own commit.
-        await send_text(
-            ctx,
-            sender,
-            "Ready to confirm... (the review & confirm step lands in the next build stage).",
-        )
+        await _show_review(ctx, sender, state)
         return
 
     # A bare fare pick with no CTA: acknowledge and keep the card in place.
@@ -418,24 +415,125 @@ async def _handle_detail(ctx: Context, sender: str, text: str, state: dict[str, 
     await _handle_intake(ctx, sender, text, state)
 
 
+# ── Stage 5 - review & confirm (deferred-tool gate) ──────────────────────────
+def _selected_fare_display(state: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Return (label, price string) for the chosen fare, or (None, None) if none."""
+    options = state.get("fare_options") or []
+    if not options:
+        return None, None
+    chosen = next(
+        (o for o in options if o["id"] == state.get("selected_fare_option")), options[0]
+    )
+    price = f"${chosen['amount']:.2f}" + (" (est.)" if chosen.get("estimated") else "")
+    return chosen["label"], price
+
+
+async def _show_review(ctx: Context, sender: str, state: dict[str, Any]) -> None:
+    """Open the deferred-tool gate and render the Stage 5 review card."""
+    itinerary = _selected_itinerary(state)
+    if itinerary is None:
+        await _search_routes(ctx, sender, state)
+        return
+
+    route_name = " → ".join(
+        (leg.get("routeShortName") or leg.get("agencyName") or "?")
+        for leg in transit_legs(itinerary)
+    ) or "Walk the whole way"
+    fare_label, fare_value = _selected_fare_display(state)
+
+    summary_rows = [
+        {"label": "Route", "value": route_name},
+        {"label": "Fare option", "value": fare_label or "Walking - free"},
+        {"label": "Total", "value": fare_value or "$0.00"},
+    ]
+
+    # Open the requires_approval gate: the finalize tool defers before running.
+    summary = f"{route_name} | {fare_label or 'walking'} {fare_value or ''}".strip()
+    try:
+        start = await start_finalize(summary)
+        state["message_history"] = start.history_json
+        state["pending_approval"] = (
+            {"tool_call_id": start.tool_call_id} if start.deferred else None
+        )
+    except Exception as exc:  # never trap the user if the LLM is unavailable
+        ctx.logger.error(f"[stage5] finalize gate failed to open: {exc}")
+        state["pending_approval"] = None
+
+    state["stage"] = AWAITING_CONFIRM
+    save_state(ctx, sender, state)
+    await send_card(
+        ctx, sender, "One last look - confirm to lock it in.", review_card(summary_rows)
+    )
+
+
+async def _handle_confirm(ctx: Context, sender: str, text: str, state: dict[str, Any]) -> None:
+    """Stage 5 dispatch: resolve the deferred-tool gate on Confirm / Start over."""
+    selection = parse_selection(text)
+    action = selection.get("action")
+    pending = state.get("pending_approval") or {}
+    tool_call_id = pending.get("tool_call_id")
+    history = state.get("message_history")
+
+    if action == "confirm":
+        if tool_call_id and history:
+            try:
+                await resume_finalize(
+                    history_json=history, tool_call_id=tool_call_id, approved=True
+                )
+            except Exception as exc:  # approval is structural; don't block the user
+                ctx.logger.error(f"[stage5] resume(approve) failed: {exc}")
+        itinerary = _selected_itinerary(state)
+        fare_label, fare_value = _selected_fare_display(state)
+        if itinerary is not None:
+            await send_card(
+                ctx,
+                sender,
+                "You're all set - have a great trip! Message me anytime to plan another.",
+                final_itinerary_card(itinerary, fare_label, fare_value),
+            )
+        # Stage 6: keep paid + message_history, drop trip state, ready for the next one.
+        clear_trip_state(state)
+        state["stage"] = DONE
+        save_state(ctx, sender, state)
+        return
+
+    if action == "cancel":
+        if tool_call_id and history:
+            try:
+                await resume_finalize(
+                    history_json=history, tool_call_id=tool_call_id, approved=False
+                )
+            except Exception as exc:
+                ctx.logger.error(f"[stage5] resume(deny) failed: {exc}")
+        clear_trip_state(state)
+        await start_intake(ctx, sender, state)
+        return
+
+    # Free text at the review card: treat as a new/overridden trip request.
+    await _handle_intake(ctx, sender, text, state)
+
+
 # ── Paid-stage dispatch (Stages 2-6) ─────────────────────────────────────────
 async def _dispatch_paid(ctx: Context, sender: str, text: str, state: dict[str, Any]) -> None:
-    """Route a paid user's message by current stage.
+    """Route a paid user's message by current stage (Stages 2-6).
 
-    Stages 3-6 are added in their own commits; until then a resolved trip stops
-    at the Stage 3 seam.
+    Anything not matching a mid-flow stage (including a brand-new intake and a
+    finished DONE session) falls through to Stage 2 intake, so the flow stays
+    usable no matter where the user is.
     """
     # TODO(interrupt-classifier): run the cross-cutting classifier here first.
     stage = state.get("stage", INTAKE)
-    if stage == INTAKE:
-        await _handle_intake(ctx, sender, text, state)
-    elif stage == SHOWING_ROUTES:
+    if stage == SHOWING_ROUTES:
         await _handle_routes(ctx, sender, text, state)
     elif stage == SHOWING_DETAIL:
         await _handle_detail(ctx, sender, text, state)
+    elif stage == AWAITING_CONFIRM:
+        await _handle_confirm(ctx, sender, text, state)
+    elif stage == DONE:
+        # Stage 6: a finished session re-enters intake with the next message.
+        await _handle_intake(ctx, sender, text, state)
     else:
-        # Stages 5+ not yet wired; restart intake so the flow stays usable.
-        await start_intake(ctx, sender, state)
+        await _handle_intake(ctx, sender, text, state)
 
 
 # ── Protocol handlers ────────────────────────────────────────────────────────

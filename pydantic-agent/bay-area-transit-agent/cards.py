@@ -307,6 +307,43 @@ def route_detail_card(
     return build_card_metadata("detail", payload)
 
 
+# ── Stage 5 - review & confirm ───────────────────────────────────────────────
+def review_card(summary_rows: list[dict[str, str]]) -> dict[str, str]:
+    """The Stage 5 ``review`` card - a read-only summary with approve/reject.
+
+    Approve/Reject map 1:1 onto the Pydantic AI deferred-tool approval that gates
+    the finalize step (research-notes.md §5).
+    """
+    payload = {
+        "title": "Confirm your trip",
+        "summary_rows": summary_rows,
+        "approve_cta": {"label": "Confirm", "selection": {"action": "confirm"}, "primary": True},
+        "reject_cta": {"label": "Start over", "selection": {"action": "cancel"}},
+    }
+    return build_card_metadata("review", payload)
+
+
+def final_itinerary_card(
+    itinerary: dict[str, Any], fare_label: str | None, fare_value: str | None
+) -> dict[str, str]:
+    """Terminal ``detail`` card summarizing the confirmed trip."""
+    legs = itinerary.get("legs", [])
+    start = legs[0].get("startTime") if legs else None
+    end = legs[-1].get("endTime") if legs else None
+    n = itinerary.get("transfers", 0) or 0
+    rows = [
+        {"label": "Route", "value": _route_title(itinerary)},
+        {"label": "Departure", "value": epoch_ms_to_clock(start)},
+        {"label": "Arrival", "value": epoch_ms_to_clock(end)},
+        {"label": "Duration", "value": fmt_duration(itinerary.get("duration"))},
+        {"label": "Transfers", "value": str(n)},
+    ]
+    if fare_label and fare_value:
+        rows.append({"label": "Fare", "value": f"{fare_label} · {fare_value}"})
+    payload = {"title": "Trip confirmed 🎉", "summary_rows": rows}
+    return build_card_metadata("detail", payload, is_terminal=True)
+
+
 def routing_error_card() -> dict[str, str]:
     """A ``detail`` card with a Try-again CTA when routing fails."""
     payload = {
