@@ -1,0 +1,28 @@
+# Fetch.ai agent framework + ASI:One chat/payment protocols
+uagents==0.23.6
+uagents-core==0.4.0
+
+# Pydantic AI - structured extraction, intent classifier, requires_approval gating
+pydantic-ai>=1.0.0
+pydantic>=2.7.0
+
+# ASI:One is reached through Pydantic AI's OpenAI-compatible model
+openai>=1.40.0
+
+# Stripe test-mode embedded Checkout - the payment gate rail
+stripe>=8.0.0
+
+# HTTP (Transitland routing/REST, 511 regional, Nominatim geocoding)
+httpx>=0.27.0
+
+# GTFS-Realtime protobuf decoding (511 TripUpdates / ServiceAlerts)
+gtfs-realtime-bindings>=1.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+
+# Dev / CI
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
+ruff>=0.8.0
+mypy>=1.11.0

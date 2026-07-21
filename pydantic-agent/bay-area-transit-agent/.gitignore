@@ -1,0 +1,18 @@
+# Secrets & local env
+.env
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# uAgents on-disk storage
+*_data.json
+
+# Cached 511 regional GTFS download + parsed fares
+.cache/
+gtfs_regional*.zip
