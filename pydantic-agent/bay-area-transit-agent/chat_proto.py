@@ -26,7 +26,7 @@ from uagents_core.contrib.protocols.chat import (
     chat_protocol_spec,
 )
 
-from ai import extract_trip, resume_finalize, start_finalize
+from ai import classify_intent, extract_trip, resume_finalize, start_finalize
 from cards import (
     disambiguation_carousel_card,
     extract_text,
@@ -332,8 +332,11 @@ async def _handle_routes(ctx: Context, sender: str, text: str, state: dict[str, 
 
 # ── Stage 4 - route + fare detail ────────────────────────────────────────────
 def _selected_itinerary(state: dict[str, Any]) -> dict[str, Any] | None:
+    raw = state.get("selected_route_id")
+    if raw is None:
+        return None
     try:
-        idx = int(state.get("selected_route_id"))
+        idx = int(raw)
     except (TypeError, ValueError):
         return None
     itineraries = (state.get("last_itineraries") or {}).get("itineraries") or []
@@ -355,8 +358,8 @@ async def _show_detail(ctx: Context, sender: str, state: dict[str, Any]) -> None
         options = []
 
     legs = transit_legs(itinerary)
-    route_ids = {leg.get("routeId") for leg in legs if leg.get("routeId")}
-    agency_ids = {leg.get("agencyId") for leg in legs if leg.get("agencyId")}
+    route_ids = {rid for leg in legs if (rid := leg.get("routeId"))}
+    agency_ids = {aid for leg in legs if (aid := leg.get("agencyId"))}
     alerts = await alerts_for_routes(route_ids, agency_ids)
 
     choices = [o.to_choice() for o in options]
@@ -513,27 +516,143 @@ async def _handle_confirm(ctx: Context, sender: str, text: str, state: dict[str,
     await _handle_intake(ctx, sender, text, state)
 
 
+# ── Cross-cutting interrupt classifier ───────────────────────────────────────
+# Card stages where a free-text message might be an interrupt rather than a
+# selection. At INTAKE/DONE free text is always just a (new) trip request.
+_CARD_STAGES = {SHOWING_ROUTES, SHOWING_DETAIL, AWAITING_CONFIRM}
+
+
+def _stage_handler(stage: str):
+    return {
+        SHOWING_ROUTES: _handle_routes,
+        SHOWING_DETAIL: _handle_detail,
+        AWAITING_CONFIRM: _handle_confirm,
+    }.get(stage, _handle_intake)
+
+
+def _fare_choices_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
+    choices = []
+    for o in state.get("fare_options") or []:
+        secondary = f"${o['amount']:.2f}" + (" (est.)" if o.get("estimated") else "")
+        choices.append({"value": o["id"], "label": o["label"], "secondary_text": secondary})
+    return choices
+
+
+async def _resend_current_card(ctx: Context, sender: str, state: dict[str, Any], note: str) -> None:
+    """Re-render the exact card for the current stage so a side-question never
+    loses the user's place. Uses only cached state - no re-fetch."""
+    stage = state.get("stage")
+    if stage == SHOWING_ROUTES:
+        itineraries = (state.get("last_itineraries") or {}).get("itineraries") or []
+        trip = state.get("trip") or {}
+        await send_card(
+            ctx, sender, note, route_carousel_card(itineraries, trip.get("priority", "fastest"))
+        )
+    elif stage == SHOWING_DETAIL:
+        itinerary = _selected_itinerary(state)
+        if itinerary is not None:
+            await send_card(
+                ctx, sender, note,
+                route_detail_card(itinerary, _fare_choices_from_state(state), []),
+            )
+    elif stage == AWAITING_CONFIRM:
+        itinerary = _selected_itinerary(state)
+        route_name = " → ".join(
+            (leg.get("routeShortName") or leg.get("agencyName") or "?")
+            for leg in transit_legs(itinerary or {})
+        ) or "Walk the whole way"
+        fare_label, fare_value = _selected_fare_display(state)
+        rows = [
+            {"label": "Route", "value": route_name},
+            {"label": "Fare option", "value": fare_label or "Walking - free"},
+            {"label": "Total", "value": fare_value or "$0.00"},
+        ]
+        await send_card(ctx, sender, note, review_card(rows))
+    else:
+        await send_text(ctx, sender, note)
+
+
+async def _handle_escalate(ctx: Context, sender: str, text: str, state: dict[str, Any]) -> None:
+    """Urgent path: skip the carousel→detail→review sequence, answer the single
+    fastest option directly with a terminal card."""
+    trip = state.get("trip")
+    itineraries = (state.get("last_itineraries") or {}).get("itineraries") or []
+    if not itineraries:
+        if not trip or not trip.get("origin_coords") or not trip.get("destination_coords"):
+            # No trip context yet - treat the urgent message as a new request.
+            await _handle_intake(ctx, sender, text, state)
+            return
+        try:
+            plan_obj = await plan(
+                trip["origin_coords"], trip["destination_coords"], trip.get("depart_time")
+            )
+            itineraries = plan_obj.get("itineraries") or []
+            state["last_itineraries"] = plan_obj
+        except RoutingError as exc:
+            ctx.logger.error(f"[escalate] routing error: {exc}")
+            await send_card(ctx, sender, "The trip planner didn't respond.", routing_error_card())
+            return
+    if not itineraries:
+        await send_text(ctx, sender, "I couldn't find any transit right now - try a different time.")
+        return
+
+    fastest = min(itineraries, key=lambda it: it.get("duration", 0) or 0)
+    state["stage"] = DONE  # a direct urgent answer ends the flow; next msg restarts
+    save_state(ctx, sender, state)
+    await send_card(
+        ctx,
+        sender,
+        "In a hurry - here's the fastest option right now:",
+        final_itinerary_card(fastest, None, None),
+    )
+
+
 # ── Paid-stage dispatch (Stages 2-6) ─────────────────────────────────────────
 async def _dispatch_paid(ctx: Context, sender: str, text: str, state: dict[str, Any]) -> None:
     """Route a paid user's message by current stage (Stages 2-6).
 
-    Anything not matching a mid-flow stage (including a brand-new intake and a
-    finished DONE session) falls through to Stage 2 intake, so the flow stays
-    usable no matter where the user is.
+    A structured card selection (JSON) fast-paths straight to the stage handler.
+    Free text at a card stage first runs the cross-cutting interrupt classifier
+    (override / escalate / side_question / clarify) so the user can type past any
+    card at any point. INTAKE/DONE free text is always a (new) trip request.
     """
-    # TODO(interrupt-classifier): run the cross-cutting classifier here first.
     stage = state.get("stage", INTAKE)
-    if stage == SHOWING_ROUTES:
-        await _handle_routes(ctx, sender, text, state)
-    elif stage == SHOWING_DETAIL:
-        await _handle_detail(ctx, sender, text, state)
-    elif stage == AWAITING_CONFIRM:
-        await _handle_confirm(ctx, sender, text, state)
-    elif stage == DONE:
-        # Stage 6: a finished session re-enters intake with the next message.
-        await _handle_intake(ctx, sender, text, state)
-    else:
-        await _handle_intake(ctx, sender, text, state)
+
+    # Fast path: a structured selection dispatches directly, no LLM call.
+    if parse_selection(text).get("action") or stage not in _CARD_STAGES:
+        await _stage_handler(stage)(ctx, sender, text, state)
+        return
+
+    # Slow path: free text mid-flow -> classify the interrupt (history attached).
+    try:
+        result = await classify_intent(
+            text, history_json=state.get("message_history"), stage=stage
+        )
+    except Exception as exc:  # classifier down -> treat as a trip override, never hang
+        ctx.logger.error(f"[classifier] failed, defaulting to override: {exc}")
+        await _handle_override(ctx, sender, text, state)
+        return
+
+    state["message_history"] = result.history_json  # persist so follow-ups keep context
+    save_state(ctx, sender, state)
+
+    if result.intent == "escalate":
+        await _handle_escalate(ctx, sender, text, state)
+    elif result.intent == "side_question":
+        note = result.reply or "Here's where we left off."
+        await _resend_current_card(ctx, sender, state, note)
+    elif result.intent == "clarify":
+        await send_text(ctx, sender, result.reply or "Could you clarify what you'd like to do?")
+    else:  # override
+        await _handle_override(ctx, sender, text, state)
+
+
+async def _handle_override(ctx: Context, sender: str, text: str, state: dict[str, Any]) -> None:
+    """A restated/different trip mid-flow: drop trip state, keep paid, re-intake."""
+    clear_trip_state(state)
+    state["stage"] = INTAKE
+    save_state(ctx, sender, state)
+    await _handle_intake(ctx, sender, text, state)
 
 
 # ── Protocol handlers ────────────────────────────────────────────────────────

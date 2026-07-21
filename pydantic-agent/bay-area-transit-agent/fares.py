@@ -141,10 +141,10 @@ def compute_fare_options(
                 priced, estimated = False, True
                 break
             estimated = estimated or est
-            if i > 0 and leg_groups[i - 1] and leg_groups[i]:
-                discount = _transfer_amount(
-                    fd, leg_groups[i - 1], leg_groups[i], rider, media_group
-                )
+            prev_lg = leg_groups[i - 1] if i > 0 else None
+            cur_lg = leg_groups[i]
+            if prev_lg and cur_lg:
+                discount = _transfer_amount(fd, prev_lg, cur_lg, rider, media_group)
                 # A transfer rule replaces the leg's own fare (free/discounted/credit).
                 # Floor at 0 - some rows encode a credit as a negative amount - and
                 # flag the option estimated, since transfer semantics are approximate.

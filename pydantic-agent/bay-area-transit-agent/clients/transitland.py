@@ -80,7 +80,7 @@ async def plan(
         "toPlace": f"{dest_coords[0]},{dest_coords[1]}",
         "date": dt.strftime("%Y-%m-%d"),
         "time": dt.strftime("%H:%M:%S"),
-        "numItineraries": max_itineraries,
+        "numItineraries": str(max_itineraries),
         "fallbackWalkingItinerary": "true",
         "api_key": _api_key(),
     }

@@ -103,6 +103,65 @@ async def extract_trip(text: str, *, model: Model | None = None) -> TripExtracti
     return out
 
 
+# ── Cross-cutting interrupt classifier ───────────────────────────────────────
+class IntentClassification(BaseModel):
+    """How to handle a free-text message that isn't a structured card selection."""
+
+    intent: Literal["override", "escalate", "side_question", "clarify"] = Field(
+        description=(
+            "override: user states a different origin/destination than the one in "
+            "progress. escalate: urgency ('now', 'stuck', 'cancelled', 'emergency') - "
+            "wants the single fastest option immediately. side_question: a question "
+            "about the current plan, not a new request. clarify: genuinely ambiguous "
+            "input that needs one direct question back."
+        )
+    )
+    reply: str = Field(
+        default="",
+        description=(
+            "For side_question: a concise answer from context. For clarify: one direct "
+            "clarifying question. Empty for override/escalate."
+        ),
+    )
+
+
+@dataclass
+class IntentResult:
+    intent: str
+    reply: str
+    history_json: str  # updated history to persist so follow-ups keep context
+
+
+_intent_agent: Agent[None, IntentClassification] = Agent(
+    _DEFAULT_MODEL,
+    output_type=IntentClassification,
+    system_prompt=(
+        "You triage a Bay Area transit user's free-text message while they are "
+        "mid-way through planning a trip (they may be looking at a list of routes, a "
+        "fare detail, or a final confirmation). Classify their message into exactly "
+        "one intent and, when the intent is side_question or clarify, provide a short "
+        "reply. Use the conversation history for context. Do not invent trip details."
+    ),
+)
+
+
+async def classify_intent(
+    text: str,
+    *,
+    history_json: str | None = None,
+    stage: str | None = None,
+    model: Model | None = None,
+) -> IntentResult:
+    """Classify a mid-flow free-text message, carrying session history for context."""
+    history = load_history(history_json) if history_json else None
+    prompt = f"Current step: {stage}\n\nUser message: {text}"
+    result = await _intent_agent.run(prompt, message_history=history, model=model)
+    out = result.output
+    return IntentResult(
+        intent=out.intent, reply=out.reply, history_json=dump_history(result.all_messages())
+    )
+
+
 # ── message_history (de)serialization ────────────────────────────────────────
 # Pydantic AI ModelMessages need the type adapter, not plain json.dumps
 # (research-notes.md §5). These back the session's ``message_history`` field.
