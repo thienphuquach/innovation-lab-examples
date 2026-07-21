@@ -40,7 +40,8 @@ def default_state() -> dict[str, Any]:
         "paid_at": None,  # ISO timestamp once paid
         "stage": UNINITIALIZED,
         "message_history": None,  # ModelMessagesTypeAdapter.dump_json string
-        "trip": None,  # normalized TripRequest dict (Stage 2)
+        "trip": None,  # normalized TripRequest dict (Stage 2), fully geocoded
+        "pending_trip": None,  # trip mid-geocoding (Stage 2.5), coords being resolved
         "last_itineraries": None,  # cached Transitland plan (Stage 3), enables Back
         "selected_route_id": None,
         "selected_fare_option": None,
@@ -75,6 +76,7 @@ def clear_trip_state(state: dict[str, Any]) -> None:
     so we return to intake with the new values without forcing a re-payment.
     """
     state["trip"] = None
+    state["pending_trip"] = None
     state["last_itineraries"] = None
     state["selected_route_id"] = None
     state["selected_fare_option"] = None

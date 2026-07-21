@@ -327,11 +327,26 @@ while not over-engineering a fake external call.
   We use this first for stop/station-name inputs ("Powell St", "Downtown Berkeley").
 - This is the **free** production tier (rate-limited) — a different product from the routing key.
 
-### Geocoding tier 2 — OSM Nominatim (untested; see Stage 2.5)
-Free `https://nominatim.openstreetmap.org/search?q=<addr>&format=jsonp&countrycodes=us&limit=..`.
-Usage policy: ≤1 req/sec, descriptive `User-Agent`, no heavy batch. **Not yet live-tested** —
-per the brief I must run real queries against both tiers early and record results here before
-building the pipeline on top. (TODO: fill in Stage 2.5 test results.)
+### Geocoding — OSM Nominatim (now the primary tier; live-tested)
+Free `https://nominatim.openstreetmap.org/search?q=<addr>&format=json&countrycodes=us&limit=5&viewbox=<bay>&bounded=1`.
+Usage policy: ≤1 req/sec, descriptive `User-Agent`, no heavy batch (implemented: async throttle +
+5-min in-process cache). Bay-Area viewbox + `bounded=1` keeps results local.
+
+**Live test results (2026-07-21, real Nominatim calls):**
+| Query | status | n | top hit (lat,lon) |
+|---|---|---|---|
+| "Downtown Berkeley" | ambiguous | 2 | Downtown Berkeley, Shattuck Ave (37.8701, -122.2681) |
+| "Powell St San Francisco" | ambiguous | 4 | Powell Street, Union Square (37.7847, -122.4072) |
+| "Fruitvale BART" | ambiguous | 3 | Fruitvale BART (37.7752, -122.2249) |
+| "the Mission San Francisco" | ambiguous | 5 | (imprecise: CCA, 7th/Mission) (37.7679, -122.4006) |
+| "Berkeley" | resolved | 1 | Berkeley, Alameda County (37.8708, -122.2729) |
+| "1600 Amphitheatre Parkway" | ambiguous | 2 | Google Bldg 41 (37.4225, -122.0856) |
+| "asdkfjqwoeixyz nonsense place" | not_found | 0 | — |
+
+Takeaways baked into the implementation: coords come back correct lat/lon; vague neighborhood
+names ("the Mission") are imperfect but correctly land in the **disambiguation carousel** path
+rather than being silently accepted; a garbage string correctly returns **not_found** →
+terminal card + re-show form. This validated the two-tier resolver before Stage 3 was built.
 
 ### 511.org Regional API (free token, no card)
 - Base `http://api.511.org/transit/`. `api_key` mandatory. Default rate limit **60 req / 3600 s**
@@ -393,7 +408,18 @@ expiry, any CVC, any ZIP. Test/live separated by key prefix (`sk_test_`/`pk_test
 
 6. **Geocoding is genuinely unvalidated.** The brief flags Stage 2.5 as the one path not
    live-tested. Confirmed nothing in either reference agent does geocoding; this is net-new and
-   gets its own early test pass recorded here before the pipeline depends on it.
+   got its own early test pass (recorded in §6) before the pipeline depended on it.
+
+7. **Transitland REST stops has no free-text name search.** The brief's Stage 2.5 tier 1 was
+   "match the input against Transitland's own stop/station search." Verified against the live
+   REST docs: the `search` (full-text) param exists only on `agencies`/`operators`/`routes`,
+   **not** on `stops`. The stops endpoint filters by `lat`/`lon`/`radius`, `served_by_onestop_ids`,
+   `served_by_route_type`, `stop_id`. (The `query` field some MCP wrappers expose is a wrapper
+   convenience, not a native param.) So there's no chicken-and-egg-free way to name-search stops.
+   **Resolution:** make Nominatim the primary geocoder (it covers stop names *and* addresses/
+   landmarks, returns multiple candidates for disambiguation, and biases to the Bay Area), rather
+   than layering it under a stops search that can't take free text. The routing endpoint only
+   needs `lat,lon`, which Nominatim supplies directly, so no stop snapping is required.
 
 ---
 

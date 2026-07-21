@@ -26,6 +26,8 @@ from uagents_core.contrib.protocols.chat import (
     TextContent,
 )
 
+from models import GeocodeCandidate
+
 CARD_PROTOCOL_VERSION = "1"
 
 
@@ -157,3 +159,42 @@ def intake_form_card() -> dict[str, str]:
         "submit_cta": {"label": "Find routes", "selection": {"action": "submit_trip"}},
     }
     return build_card_metadata("form", payload)
+
+
+# ── Stage 2.5 - geocoding disambiguation + no-match ───────────────────────────
+def _short_label(label: str) -> tuple[str, str]:
+    """Split a Nominatim display_name into (title, subtitle)."""
+    parts = [p.strip() for p in label.split(",")]
+    title = parts[0] if parts else label
+    subtitle = ", ".join(parts[1:4]) if len(parts) > 1 else ""
+    return title, subtitle
+
+
+def disambiguation_carousel_card(field: str, candidates: list[GeocodeCandidate]) -> dict[str, str]:
+    """A ``carousel`` asking the user which match they meant for ``field``."""
+    items = []
+    for i, c in enumerate(candidates):
+        title, subtitle = _short_label(c.label)
+        items.append(
+            {
+                "id": f"{field}_{i}",
+                "title": title,
+                "subtitle": subtitle,
+                "primary_cta": {"label": "Use this", "selection": c.to_selection(field)},
+            }
+        )
+    payload = {
+        "title": f"Which {'starting point' if field == 'origin' else 'destination'}?",
+        "subtitle": "Pick the closest match, or retype it in chat.",
+        "items": items,
+    }
+    return build_card_metadata("carousel", payload)
+
+
+def terminal_info_card(title: str, body: str) -> dict[str, str]:
+    """A read-only informational ``detail`` card (no interaction expected)."""
+    payload = {
+        "title": title,
+        "summary_rows": [{"label": "", "value": body}],
+    }
+    return build_card_metadata("detail", payload, is_terminal=True)
