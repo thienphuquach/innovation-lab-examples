@@ -33,16 +33,20 @@ from cards import (
     intake_form_card,
     parse_selection,
     route_carousel_card,
+    route_detail_card,
     routing_error_card,
     send_card,
     send_text,
     terminal_info_card,
 )
+from clients.five11 import alerts_for_routes, load_fare_data
 from clients.geocode import resolve_place
-from clients.transitland import RoutingError, plan
+from clients.transitland import RoutingError, plan, transit_legs
+from fares import compute_fare_options
 from models import depart_option_to_iso, new_trip, validate_trip_texts
 from payment import confirm_payment_via_text, request_payment
 from session_state import (
+    AWAITING_CONFIRM,
     INTAKE,
     SHOWING_DETAIL,
     SHOWING_ROUTES,
@@ -314,18 +318,103 @@ async def _handle_routes(ctx: Context, sender: str, text: str, state: dict[str, 
             await _search_routes(ctx, sender, state)
             return
         state["selected_route_id"] = str(idx)
-        state["stage"] = SHOWING_DETAIL
         save_state(ctx, sender, state)
-        # Stage 4 (route+fare detail) replaces this stub in its own commit.
-        await send_text(
-            ctx,
-            sender,
-            "Pulling up that route's fares and live status... "
-            "(fare detail lands in the next build stage).",
-        )
+        await _show_detail(ctx, sender, state)
         return
 
     # Free text at the carousel: treat as a new/overridden trip request.
+    await _handle_intake(ctx, sender, text, state)
+
+
+# ── Stage 4 - route + fare detail ────────────────────────────────────────────
+def _selected_itinerary(state: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        idx = int(state.get("selected_route_id"))
+    except (TypeError, ValueError):
+        return None
+    itineraries = (state.get("last_itineraries") or {}).get("itineraries") or []
+    return itineraries[idx] if 0 <= idx < len(itineraries) else None
+
+
+async def _show_detail(ctx: Context, sender: str, state: dict[str, Any]) -> None:
+    """Compute fares + pull the live overlay and render the detail card."""
+    itinerary = _selected_itinerary(state)
+    if itinerary is None:
+        await _search_routes(ctx, sender, state)
+        return
+
+    try:
+        fare_data = await load_fare_data()
+        options = compute_fare_options(itinerary.get("legs", []), fare_data)
+    except Exception as exc:  # fares are best-effort; never block the trip on them
+        ctx.logger.error(f"[stage4] fare computation failed: {exc}")
+        options = []
+
+    legs = transit_legs(itinerary)
+    route_ids = {leg.get("routeId") for leg in legs if leg.get("routeId")}
+    agency_ids = {leg.get("agencyId") for leg in legs if leg.get("agencyId")}
+    alerts = await alerts_for_routes(route_ids, agency_ids)
+
+    choices = [o.to_choice() for o in options]
+    state["fare_options"] = [
+        {"id": o.id, "label": o.label, "amount": o.amount, "estimated": o.estimated}
+        for o in options
+    ]
+    # Default the selection to the cheapest option (options are sorted).
+    state["selected_fare_option"] = options[0].id if options else None
+    state["stage"] = SHOWING_DETAIL
+    save_state(ctx, sender, state)
+
+    lead = "Here's the route with fares and any live alerts."
+    if options and options[0].estimated:
+        lead += " Fares marked (est.) are approximate where an operator uses zone pricing."
+    await send_card(ctx, sender, lead, route_detail_card(itinerary, choices, alerts))
+
+
+async def _handle_detail(ctx: Context, sender: str, text: str, state: dict[str, Any]) -> None:
+    """Stage 4 dispatch: choose a fare + continue, go back, or override."""
+    selection = parse_selection(text)
+    action = selection.get("action")
+
+    if selection.get("fare"):
+        state["selected_fare_option"] = str(selection["fare"])
+        save_state(ctx, sender, state)
+
+    if action == "back_to_routes":
+        itineraries = (state.get("last_itineraries") or {}).get("itineraries") or []
+        if not itineraries:
+            await _search_routes(ctx, sender, state)
+            return
+        trip = state.get("trip") or {}
+        state["stage"] = SHOWING_ROUTES
+        save_state(ctx, sender, state)
+        await send_card(
+            ctx,
+            sender,
+            "Back to your route options.",
+            route_carousel_card(itineraries, trip.get("priority", "fastest")),
+        )
+        return
+
+    if action == "continue_review":
+        state["stage"] = AWAITING_CONFIRM
+        save_state(ctx, sender, state)
+        # Stage 5 (review + deferred-tool gate) replaces this stub in its own commit.
+        await send_text(
+            ctx,
+            sender,
+            "Ready to confirm... (the review & confirm step lands in the next build stage).",
+        )
+        return
+
+    # A bare fare pick with no CTA: acknowledge and keep the card in place.
+    if selection.get("fare"):
+        await send_text(
+            ctx, sender, "Got it - tap \"Confirm this trip\" when you're ready."
+        )
+        return
+
+    # Free text at the detail card: treat as a new/overridden trip request.
     await _handle_intake(ctx, sender, text, state)
 
 
@@ -342,8 +431,10 @@ async def _dispatch_paid(ctx: Context, sender: str, text: str, state: dict[str, 
         await _handle_intake(ctx, sender, text, state)
     elif stage == SHOWING_ROUTES:
         await _handle_routes(ctx, sender, text, state)
+    elif stage == SHOWING_DETAIL:
+        await _handle_detail(ctx, sender, text, state)
     else:
-        # Stages 4+ not yet wired; restart intake so the flow stays usable.
+        # Stages 5+ not yet wired; restart intake so the flow stays usable.
         await start_intake(ctx, sender, state)
 
 

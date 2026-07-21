@@ -44,6 +44,7 @@ def default_state() -> dict[str, Any]:
         "pending_trip": None,  # trip mid-geocoding (Stage 2.5), coords being resolved
         "last_itineraries": None,  # cached Transitland plan (Stage 3), enables Back
         "selected_route_id": None,
+        "fare_options": None,  # cached FareOption dicts (Stage 4)
         "selected_fare_option": None,
         "pending_approval": None,  # deferred-tool handle (Stage 5)
         # ── internal payment bookkeeping ──
@@ -79,6 +80,7 @@ def clear_trip_state(state: dict[str, Any]) -> None:
     state["pending_trip"] = None
     state["last_itineraries"] = None
     state["selected_route_id"] = None
+    state["fare_options"] = None
     state["selected_fare_option"] = None
     state["pending_approval"] = None
 

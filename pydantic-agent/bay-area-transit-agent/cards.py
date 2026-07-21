@@ -265,6 +265,48 @@ def route_carousel_card(itineraries: list[dict[str, Any]], priority: str) -> dic
     return build_card_metadata("carousel", payload)
 
 
+# ── Stage 4 - route + fare detail ────────────────────────────────────────────
+def route_detail_card(
+    itinerary: dict[str, Any],
+    fare_choices: list[dict[str, Any]],
+    alerts: list[str],
+) -> dict[str, str]:
+    """Build the Stage 4 ``detail`` card: summary rows + fare radio + live alerts."""
+    legs = itinerary.get("legs", [])
+    start = legs[0].get("startTime") if legs else None
+    end = legs[-1].get("endTime") if legs else None
+    n = itinerary.get("transfers", 0) or 0
+
+    summary_rows = [
+        {"label": "Route", "value": _route_title(itinerary)},
+        {"label": "Departure", "value": epoch_ms_to_clock(start)},
+        {"label": "Arrival", "value": epoch_ms_to_clock(end)},
+        {"label": "Transfers", "value": str(n)},
+        {"label": "Duration", "value": fmt_duration(itinerary.get("duration"))},
+    ]
+    for alert in alerts:
+        summary_rows.append({"label": "⚠ Alert", "value": alert})
+
+    payload: dict[str, Any] = {
+        "title": "Route & fares",
+        "summary_rows": summary_rows,
+        "ctas": [
+            {"label": "Confirm this trip", "selection": {"action": "continue_review"}, "primary": True},
+            {"label": "Back to routes", "selection": {"action": "back_to_routes"}},
+        ],
+    }
+    if fare_choices:
+        payload["sub_options"] = {
+            "name": "fare",
+            "kind": "radio",
+            "label": "How to pay (cheapest first)",
+            "choices": fare_choices,
+        }
+    else:
+        payload["summary_rows"].append({"label": "Fare", "value": "Walking - free"})
+    return build_card_metadata("detail", payload)
+
+
 def routing_error_card() -> dict[str, str]:
     """A ``detail`` card with a Try-again CTA when routing fails."""
     payload = {

@@ -113,7 +113,13 @@ async def test_pick_route_advances_to_detail(ctx, sender, monkeypatch):
     async def fake_plan(o, d, t, **k):
         return _fake_plan()
 
+    async def fake_alerts(route_ids, agency_ids):
+        return []
+
     monkeypatch.setattr(chat_proto, "plan", fake_plan)
+    # Stage 4 now runs on selection; stub its network boundaries.
+    monkeypatch.setattr(chat_proto, "load_fare_data", _boom_fare_data)
+    monkeypatch.setattr(chat_proto, "alerts_for_routes", fake_alerts)
     state = _routes_state(ctx, sender)
     await chat_proto._search_routes(ctx, sender, state)
     ctx.sent.clear()
@@ -125,6 +131,10 @@ async def test_pick_route_advances_to_detail(ctx, sender, monkeypatch):
     saved = get_state(ctx, sender)
     assert saved["stage"] == SHOWING_DETAIL
     assert saved["selected_route_id"] == "1"
+
+
+async def _boom_fare_data():
+    raise RuntimeError("no network in tests")
 
 
 async def test_long_wait_earns_warning_badge():
