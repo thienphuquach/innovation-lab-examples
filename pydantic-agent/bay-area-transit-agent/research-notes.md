@@ -151,10 +151,13 @@ Imported from `uagents_core.contrib.protocols.chat`:
   `agent.include(chat_proto, publish_manifest=True)`.
 
 Rhythm: on **every** inbound `ChatMessage`, immediately send a `ChatAcknowledgement`
-(both reference agents do this first thing), then process. Session identity: `ctx.session`
-changes per chat window; `sender` is stable per user and can be **reused across windows**,
-so a new window must reset state (see `session_state.check_new_window_and_reset` — we
-replicate this, otherwise a brand-new conversation silently resumes an already-paid one).
+(both reference agents do this first thing), then process. Session identity: `sender` is
+stable per user and can be **reused across windows**, so a new window must reset state.
+`StartSessionContent` is the protocol's own "this message begins a new session" signal
+(see `session_state.reset_on_new_window`) — a brand-new conversation carries it, so that's
+what triggers the reset + re-charge. An earlier version compared `ctx.session` ids instead;
+that fired spuriously on structured card-submission turns (`ctx.session` is not stable
+across every turn), incorrectly re-charging an already-paid, mid-flow sender.
 
 ---
 

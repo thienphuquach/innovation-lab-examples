@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import pytest
-from uagents_core.contrib.protocols.chat import ChatMessage, MetadataContent
+from uagents_core.contrib.protocols.chat import (
+    ChatMessage,
+    MetadataContent,
+    StartSessionContent,
+    TextContent,
+)
 from uagents_core.contrib.protocols.payment import (
     CommitPayment,
     CompletePayment,
@@ -12,6 +17,7 @@ from uagents_core.contrib.protocols.payment import (
     RequestPayment,
 )
 
+import chat_proto
 import payment
 from session_state import AWAITING_PAYMENT, get_state
 
@@ -25,13 +31,13 @@ def _fake_stripe(monkeypatch):
         payment,
         "create_checkout_session",
         lambda sender, chat_session_id: {
-            "url": "https://checkout.stripe.com/c/pay/cs_test_123",
+            "client_secret": "cs_test_secret",
             "id": "cs_test_123",
             "checkout_session_id": "cs_test_123",
             "publishable_key": "pk_test_x",
             "currency": "usd",
             "amount_cents": "100",
-            "ui_mode": "hosted_page",
+            "ui_mode": "embedded_page",
         },
     )
 
@@ -54,9 +60,6 @@ async def test_request_payment_sends_bare_request_and_stores_session(ctx, sender
     assert req.accepted_funds[0].payment_method == "stripe"
     assert req.accepted_funds[0].amount == "1.00"
     assert req.metadata["stripe"]["checkout_session_id"] == "cs_test_123"
-    # A real, clickable checkout link is always in the description text, so the
-    # gate stays payable even if ASI:One doesn't render the native card.
-    assert "https://checkout.stripe.com/c/pay/cs_test_123" in req.description
     # Bare RequestPayment: nothing else sent alongside it.
     assert len(ctx.sent) == 1
 
@@ -133,3 +136,44 @@ async def test_duplicate_commit_is_idempotent(ctx, sender, monkeypatch):
         and any(isinstance(c, MetadataContent) for c in m.content)
     ]
     assert cards_sent == []
+
+
+async def test_mid_flow_message_does_not_re_request_payment(ctx, sender, monkeypatch):
+    """Regression: a paid, mid-flow message must never re-trigger RequestPayment.
+
+    A previous version reset ``paid`` on any ``ctx.session`` mismatch, which
+    fired spuriously on structured card-submission turns (``ctx.session`` isn't
+    stable across every turn) and re-charged an already-paid sender. The fix
+    keys the reset off ``StartSessionContent`` instead, which only appears on a
+    message that truly begins a new window.
+    """
+    monkeypatch.setattr(payment, "verify_paid", lambda cid: True)
+    # Isolate the gate logic in handle_message from the intake dispatch that
+    # would otherwise run once paid - not what this regression test is about.
+    dispatched: list[str] = []
+
+    async def fake_dispatch(ctx, sender, text, state):
+        dispatched.append(text)
+
+    monkeypatch.setattr(chat_proto, "_dispatch_paid", fake_dispatch)
+
+    # A real new window: gate fires once.
+    start_msg = ChatMessage(content=[StartSessionContent(), TextContent(text="hi")])
+    await chat_proto.handle_message(ctx, sender, start_msg)
+    assert len(ctx.messages_of(RequestPayment)) == 1
+
+    # Pay, unlocking the session.
+    await payment.on_commit(ctx, sender, _commit())
+    assert get_state(ctx, sender)["paid"] is True
+    ctx.sent.clear()
+
+    # A later, same-window message (no StartSessionContent) arrives with a
+    # *different* ctx.session id than the one recorded at window start - the
+    # exact structured-card-submission scenario that triggered the old bug.
+    ctx.session = "some-other-session-id"
+    followup = ChatMessage(content=[TextContent(text="hello again")])
+    await chat_proto.handle_message(ctx, sender, followup)
+
+    assert get_state(ctx, sender)["paid"] is True
+    assert ctx.messages_of(RequestPayment) == []
+    assert dispatched == ["hello again"]

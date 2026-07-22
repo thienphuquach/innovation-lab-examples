@@ -21,7 +21,6 @@ from uagents import Context, Protocol
 from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement,
     ChatMessage,
-    StartSessionContent,
     TextContent,
     chat_protocol_spec,
 )
@@ -53,9 +52,9 @@ from session_state import (
     INTAKE,
     SHOWING_DETAIL,
     SHOWING_ROUTES,
-    check_new_window_and_reset,
     clear_trip_state,
     get_state,
+    reset_on_new_window,
     save_state,
 )
 
@@ -665,11 +664,12 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
         ),
     )
 
-    check_new_window_and_reset(ctx, sender)
+    # A brand-new conversation window always starts unpaid (per chat-window
+    # unlock) - reset_on_new_window wipes state and tells us to gate below.
+    is_new_window = reset_on_new_window(ctx, sender, msg)
     state = get_state(ctx, sender)
 
-    # A brand-new conversation (StartSession) from an unpaid sender => gate.
-    if any(isinstance(c, StartSessionContent) for c in msg.content) and not state["paid"]:
+    if is_new_window:
         await request_payment(ctx, sender, state)
         return
 

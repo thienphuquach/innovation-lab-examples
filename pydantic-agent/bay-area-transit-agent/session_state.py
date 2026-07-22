@@ -16,9 +16,12 @@ string.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from uagents import Context
+
+if TYPE_CHECKING:
+    from uagents_core.contrib.protocols.chat import ChatMessage
 
 # ── Stage constants (the "stage" field) ──────────────────────────────────────
 UNINITIALIZED = "uninitialized"  # brand-new sender, nothing sent yet
@@ -30,7 +33,6 @@ AWAITING_CONFIRM = "awaiting_confirm"  # Stage 5 - review card, deferred-tool ga
 DONE = "done"  # Stage 6 - finished; next message re-enters intake
 
 _SESSION_KEY = "session:{}"
-_WINDOW_KEY = "window:{}"
 
 
 def default_state() -> dict[str, Any]:
@@ -85,19 +87,27 @@ def clear_trip_state(state: dict[str, Any]) -> None:
     state["pending_approval"] = None
 
 
-def check_new_window_and_reset(ctx: Context, sender: str) -> None:
-    """Force a full reset when a message arrives on a new chat window.
+def reset_on_new_window(ctx: Context, sender: str, msg: "ChatMessage") -> bool:
+    """Force a full reset when this message starts a new chat window.
 
     ``ctx.storage`` is keyed by ``sender``, and ASI:One reuses the same
-    ``sender`` across a user's separate chat conversations, while ``ctx.session``
-    changes per window. The product decision for this agent is a per-chat-window
-    unlock: each new conversation must pay again. Comparing the stored window id
-    against the current ``ctx.session`` is what enforces that - without it a new
-    chat would silently resume an already-paid session. Mirrors the identical fix
-    in ``shipping-label-agent``/``quiz-agent``.
+    ``sender`` across a user's separate chat conversations. The product decision
+    for this agent is a per-chat-window unlock: each new conversation must pay
+    again. ``StartSessionContent`` is the Chat Protocol's own signal for "this
+    message begins a new session" - sent once, at the true start of a window -
+    so it is what triggers the reset.
+
+    An earlier version compared the stored ``ctx.session`` id against the
+    current one instead. That fired spuriously on structured card-submission
+    turns (``ctx.session`` isn't stable across every turn of a conversation),
+    incorrectly wiping - and re-charging - an already-paid, mid-flow sender.
+
+    Returns True if this message started a new window (so the caller knows to
+    treat the sender as freshly unpaid).
     """
-    current_window = str(ctx.session)
-    stored_window = ctx.storage.get(_WINDOW_KEY.format(sender))
-    if stored_window and stored_window != current_window:
+    from uagents_core.contrib.protocols.chat import StartSessionContent
+
+    is_new_window = any(isinstance(c, StartSessionContent) for c in msg.content)
+    if is_new_window:
         save_state(ctx, sender, default_state())
-    ctx.storage.set(_WINDOW_KEY.format(sender), current_window)
+    return is_new_window
