@@ -13,17 +13,9 @@ product requirement that this gate behave exactly like that reference:
   unless the secret key starts with ``sk_test_`` (and the publishable key, if
   set, with ``pk_test_``).
 
-Two differences from the shipping-label reference:
-1. This agent charges **once per chat session** (a single unlock fee), so there
-   is only the ``"gate"`` purpose - no second per-item charge.
-2. Checkout mode: shipping-label-agent uses ``ui_mode="embedded_page"``. Live
-   testing here reproduced, across many real attempts, ASI:One never rendering
-   the native embedded card for this agent despite identical protocol
-   registration and Stripe config to that working reference - see
-   :func:`create_checkout_session`. This agent uses Stripe's default **hosted**
-   mode instead so ``RequestPayment.description`` always carries a real,
-   clickable checkout link, guaranteeing the gate stays payable by an actual
-   user even when the native card doesn't render.
+The one difference from the shipping-label reference: this agent charges **once
+per chat session** (a single unlock fee), so there is only the ``"gate"`` purpose
+- no second per-item charge.
 """
 
 from __future__ import annotations
@@ -105,34 +97,25 @@ def amount_str(amount_cents: int | None = None) -> str:
 
 
 def create_checkout_session(sender: str, chat_session_id: str) -> dict[str, Any]:
-    """Create a **hosted** Stripe Checkout session for the one-time unlock.
+    """Create an **embedded** Stripe Checkout session for the one-time unlock.
 
-    Uses Stripe's default hosted mode (not ``ui_mode="embedded_page"``, unlike
-    ``shipping-label-agent``): hosted sessions return a real, clickable ``url``,
-    whereas embedded sessions only return a ``client_secret`` meant to be
-    mounted in an iframe and have no link a user can open on their own. ASI:One
-    is meant to render its own native "Pay with Stripe" card from a bare
-    ``RequestPayment`` regardless of checkout mode - but when that native
-    rendering doesn't happen (observed live: identical protocol registration
-    and Stripe config to the working ``shipping-label-agent`` reference, yet no
-    card rendered across repeated real attempts), a plain-text fallback with no
-    clickable link is a dead end. Putting the hosted ``url`` in
-    ``RequestPayment.description`` guarantees the gate is actually payable by a
-    real user either way. ``verify_paid``/``confirm_payment_via_text`` are
-    unaffected by this: hosted and embedded checkouts are the same underlying
-    ``Checkout Session`` object with identical ``id``/``payment_status``.
+    ``ui_mode="embedded_page"`` is what ASI:One's native payment card renderer
+    expects (mirrored from shipping-label-agent): it uses ``client_secret`` +
+    ``publishable_key`` to mount the Stripe form in-place when the user taps
+    "Pay with Stripe", rather than redirecting to a hosted checkout page.
     """
     c = config()
     s = _stripe()
-    success_url = (
+    return_url = (
         f"{c['success_url']}?session_id={{CHECKOUT_SESSION_ID}}"
         f"&chat_session_id={chat_session_id}&user={sender}"
     )
     session = s.checkout.Session.create(
+        ui_mode="embedded_page",
+        redirect_on_completion="if_required",
         payment_method_types=["card"],
         mode="payment",
-        success_url=success_url,
-        cancel_url=c["success_url"],
+        return_url=return_url,
         expires_at=_expires_at(),
         line_items=[
             {
@@ -151,13 +134,13 @@ def create_checkout_session(sender: str, chat_session_id: str) -> dict[str, Any]
         },
     )
     return {
-        "url": getattr(session, "url", "") or "",
+        "client_secret": getattr(session, "client_secret", "") or "",
         "id": session.id,
         "checkout_session_id": session.id,
         "publishable_key": c["publishable_key"],
         "currency": c["currency"],
         "amount_cents": str(c["amount_cents"]),
-        "ui_mode": getattr(session, "ui_mode", "hosted_page") or "hosted_page",
+        "ui_mode": "embedded_page",
     }
 
 
@@ -190,15 +173,8 @@ async def request_payment(ctx: Context, sender: str, state_data: dict[str, Any])
     """Create a fresh Stripe checkout, store it, and send a bare ``RequestPayment``.
 
     Sends ONLY ``RequestPayment`` - no text before/after in this call - so ASI:One
-    can render the native payment sheet from this message alone. A stale
-    checkout is never reused: every call mints a new Checkout Session.
-
-    ``description`` always includes the real, clickable checkout ``url`` as a
-    fallback: if ASI:One renders its native card, the user pays through that;
-    if it instead shows only this description text (observed live for this
-    agent despite correct protocol registration - see ``payment.create_checkout_session``),
-    the user still has a working link, so the "must pay before use" gate stays
-    enforceable either way.
+    renders the native payment sheet from this message alone. A stale
+    ``client_secret`` is never reused: every call mints a new Checkout Session.
     """
     checkout = await asyncio.to_thread(create_checkout_session, sender, str(ctx.session))
 
@@ -207,10 +183,6 @@ async def request_payment(ctx: Context, sender: str, state_data: dict[str, Any])
     save_state(ctx, sender, state_data)
 
     amount = amount_str()
-    pay_url = checkout.get("url") or ""
-    description = f"Unlock the Bay Area Transit & Fare Concierge for ${amount}."
-    if pay_url:
-        description += f" Pay securely with Stripe: {pay_url}"
     await ctx.send(
         sender,
         RequestPayment(
@@ -218,7 +190,7 @@ async def request_payment(ctx: Context, sender: str, state_data: dict[str, Any])
             recipient=str(ctx.agent.address),
             deadline_seconds=int(os.getenv("STRIPE_CHECKOUT_EXPIRES_SECONDS", "1800")),
             reference=str(ctx.session),
-            description=description,
+            description=f"Unlock the Bay Area Transit & Fare Concierge for ${amount}.",
             metadata={"stripe": checkout, "service": "bay_area_transit", "purpose": "gate"},
         ),
     )

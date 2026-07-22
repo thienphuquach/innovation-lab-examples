@@ -26,6 +26,12 @@ agent = Agent(
     port=int(os.getenv("AGENT_PORT", "8090")),
     mailbox=True,
     publish_agent_details=True,
+    description=(
+        "Plan a multi-modal Bay Area transit trip and see the cheapest way to pay "
+        "for it (Clipper vs. cash vs. day pass). A one-time $5 Stripe unlock is "
+        "required before any trip planning - test mode only, no real charge."
+    ),
+    readme_path=os.path.join(os.path.dirname(__file__), "README.md"),
 )
 
 # ``ctx.storage`` persists to a JSON file across restarts. For an example agent,
