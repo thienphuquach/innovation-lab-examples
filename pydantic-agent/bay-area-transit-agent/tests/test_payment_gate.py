@@ -25,13 +25,13 @@ def _fake_stripe(monkeypatch):
         payment,
         "create_checkout_session",
         lambda sender, chat_session_id: {
-            "client_secret": "cs_test_secret",
+            "url": "https://checkout.stripe.com/c/pay/cs_test_123",
             "id": "cs_test_123",
             "checkout_session_id": "cs_test_123",
             "publishable_key": "pk_test_x",
             "currency": "usd",
             "amount_cents": "100",
-            "ui_mode": "embedded_page",
+            "ui_mode": "hosted_page",
         },
     )
 
@@ -54,6 +54,9 @@ async def test_request_payment_sends_bare_request_and_stores_session(ctx, sender
     assert req.accepted_funds[0].payment_method == "stripe"
     assert req.accepted_funds[0].amount == "1.00"
     assert req.metadata["stripe"]["checkout_session_id"] == "cs_test_123"
+    # A real, clickable checkout link is always in the description text, so the
+    # gate stays payable even if ASI:One doesn't render the native card.
+    assert "https://checkout.stripe.com/c/pay/cs_test_123" in req.description
     # Bare RequestPayment: nothing else sent alongside it.
     assert len(ctx.sent) == 1
 
