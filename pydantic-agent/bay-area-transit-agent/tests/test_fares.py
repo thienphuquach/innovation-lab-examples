@@ -146,11 +146,18 @@ async def test_show_detail_renders_fares_and_alert(ctx, sender, monkeypatch):
     state = _detail_state(ctx, sender)
     await chat_proto._show_detail(ctx, sender, state)
 
+    # The walkthrough (custom card) carries live alerts; the fare/confirm
+    # (detail card) is just the payment decision (ux-diagnosis.md issue B).
+    walkthrough = _cards(ctx, "custom")
+    assert walkthrough
+    walkthrough_payload = json.loads(walkthrough[0]["card_payload"])
+    badges = [c["label"] for c in walkthrough_payload["root"]["children"] if c["type"] == "badge"]
+    assert any("Delays on Line 1" in b for b in badges)
+
     metas = _cards(ctx, "detail")
     assert metas
     payload = json.loads(metas[0]["card_payload"])
     assert payload["sub_options"]["choices"][0]["value"] == "clipper"
-    assert any(row["label"] == "⚠ Alert" for row in payload["summary_rows"])
     saved = get_state(ctx, sender)
     assert saved["stage"] == SHOWING_DETAIL
     assert saved["selected_fare_option"] == "clipper"

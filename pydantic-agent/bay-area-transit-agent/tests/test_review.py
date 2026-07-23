@@ -126,7 +126,7 @@ async def test_confirm_finalizes_and_enters_done(ctx, sender, monkeypatch):
 
     await chat_proto._handle_confirm(ctx, sender, json.dumps({"action": "confirm"}), state)
 
-    metas = _cards(ctx, "detail")
+    metas = _cards(ctx, "custom")  # final_itinerary_card is now a custom list-sequence card
     assert metas and metas[0].get("is_terminal") == "true"
     saved = get_state(ctx, sender)
     assert saved["stage"] == DONE

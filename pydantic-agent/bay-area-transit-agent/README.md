@@ -15,8 +15,10 @@ card-driven flow of [`news-card-agent`](../../news-card-agent). See
 [`research-notes.md`](./research-notes.md) for the wire-protocol details and every
 place the live docs differed from the original brief, and
 [`diagnosis.md`](./diagnosis.md) for the round-2 live-testing findings (zero-route
-recovery, disambiguation, per-leg instructions, fare breakdown, and the map image)
-behind several of the behaviors below.
+recovery, disambiguation, per-leg instructions, fare breakdown, and the map image),
+and [`ux-diagnosis.md`](./ux-diagnosis.md) for the round-3 comprehension findings
+(plain-language route names, the walkthrough card, and the improved map) behind
+several of the behaviors below.
 
 > **Test mode only.** The agent refuses to start unless `STRIPE_SECRET_KEY` /
 > `STRIPE_PUBLISHABLE_KEY` are Stripe **test** keys. No real money ever moves.
@@ -29,11 +31,11 @@ behind several of the behaviors below.
 | 1 — Verification | `CommitPayment` → verify `payment_status == "paid"` with retries → unlock | Payment Protocol (`seller`) |
 | 2 — Intake | Collect origin / destination / depart time / priority | `form` card **or** free text |
 | 2.5 — Geocoding | Resolve text to coordinates (Transitland stops → Nominatim fallback) | `carousel` for disambiguation |
-| 3 — Routes | Transitland itineraries with Fastest / Fewest-transfers / Long-wait badges | `carousel` |
-| 4 — Route + fares | Fare-by-payment-method + live 511 GTFS-RT alerts for the chosen route | `detail` card |
-| 5 — Review & confirm | A Pydantic AI `requires_approval=True` deferred tool gates the finalize step; the confirmation includes a per-leg board/alight/direction breakdown plus a self-hosted map image of the route | `review` card, then a terminal `detail` card + image |
+| 3 — Routes | Transitland itineraries, titled in plain language (e.g. "BART train", not a line-color code) with Fastest / Fewest-transfers / Long-wait badges | `carousel` |
+| 4 — Route + fares | Sent as **two** cards: a step-by-step walkthrough (board/alight/direction per leg + live 511 GTFS-RT alerts) *before* the payment decision, so the clearest explanation lands while the user is still deciding whether to proceed - then the fare-by-payment-method choice itself | `custom` list card, then a `detail` card |
+| 5 — Review & confirm | A Pydantic AI `requires_approval=True` deferred tool gates the finalize step; the confirmation recaps the same walkthrough, plus a self-hosted map image (leg-coloured, with distinct start/transfer/end markers, a plain-language colour legend, and a free "open in Google Maps" link for a live view) | `review` card, then a terminal `custom` card + image |
 | 6 — Repeat use | A finished session keeps the paid unlock and re-enters intake on the next message | — |
-| Cross-cutting | An interrupt classifier lets a user type past any card at any stage (override / escalate / side-question / clarify) | — |
+| Cross-cutting | An interrupt classifier lets a user type past any card at any stage (override / escalate / side-question / clarify / accept_default - "just pick for me") | — |
 
 ## Prerequisites
 
@@ -103,11 +105,13 @@ calls. Pydantic AI agents are driven by `TestModel`/`FunctionModel`, network
 clients are monkeypatched, and `ctx` is an in-memory fake. Coverage spans the
 payment gate, intake + geocoding (resolved / ambiguous / not-found), the routing
 carousel (including the zero-route recovery + alternate-geocode retry), card
-label/instruction builders, the fare engine (Clipper transfer discounts, day
+label/instruction builders (including the plain-language route titles and the
+walkthrough list-sequence card), the fare engine (Clipper transfer discounts, day
 passes, estimated zone fares, partial pricing with explicit unsupported-method
 notes), the `requires_approval` finalize gate (defer / approve / deny), the trip
-map image (polyline decode + best-effort render/upload failure handling), and the
-interrupt classifier (fast-path + all four intents + graceful degradation).
+map image (polyline decode, the colour legend/Google-Maps-link builders, and
+best-effort render/upload failure handling), and the interrupt classifier
+(fast-path + all five intents, including `accept_default`, + graceful degradation).
 
 ## Project layout
 
@@ -118,7 +122,7 @@ payment.py          Agent Payment Protocol seller role + Stripe checkout/verify
 ai.py               Pydantic AI: trip extraction, intent classifier, finalize gate
 cards.py            Interactive-card builders + shared send/parse helpers
 fares.py            GTFS-Fares v2 fare engine (per payment method)
-map_image.py        Confirmed-trip map image (polyline render + External Storage upload)
+map_image.py        Confirmed-trip map image + colour legend + Google Maps link
 models.py           Trip models + time/format helpers
 session_state.py    Per-sender session schema in ctx.storage
 clients/
@@ -127,5 +131,6 @@ clients/
   five11.py         511 regional GTFS + Fares v2 + GTFS-RT alerts
 research-notes.md   Mandatory-research findings + doc discrepancies
 diagnosis.md        Round-2 live-testing investigation (root causes, pre-fix)
+ux-diagnosis.md     Round-3 comprehension/UX investigation (root causes, pre-fix)
 tests/              Offline test suite
 ```

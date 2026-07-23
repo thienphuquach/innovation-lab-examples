@@ -14,6 +14,7 @@ Stage 2 intake.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -36,6 +37,8 @@ from cards import (
     review_card,
     route_carousel_card,
     route_detail_card,
+    route_title,
+    route_walkthrough_card,
     routing_error_card,
     send_card,
     send_resource,
@@ -90,7 +93,9 @@ async def start_intake(
     elif welcome:
         narration = (
             "Payment confirmed - you're unlocked! Where are you headed? Fill in the trip "
-            'form, or just tell me in your own words (e.g. "Berkeley to the Mission at 6pm").'
+            'form, or just tell me in your own words (e.g. "Berkeley to the Mission at 6pm"). '
+            "New to Bay Area transit? At any point, just ask me to explain something, or say "
+            '"you decide" / "pick for me" and I\'ll go with a sensible default.'
         )
     else:
         narration = "Let's plan a trip. Fill in the form, or just describe it in a sentence."
@@ -479,13 +484,25 @@ async def _show_detail(ctx: Context, sender: str, state: dict[str, Any]) -> None
     state["stage"] = SHOWING_DETAIL
     save_state(ctx, sender, state)
 
-    lead = "Here's the route with fares and any live alerts."
-    if options and options[0].estimated:
-        lead += " Fares marked (est.) are approximate where an operator uses zone pricing."
     leg_amounts = options[0].leg_amounts if options else None
+    # The walkthrough goes out first, on its own: the clearest explanation of
+    # what the trip involves belongs at the point a rider is deciding whether
+    # to proceed, not only after they've confirmed (ux-diagnosis.md issue C).
     await send_card(
-        ctx, sender, lead,
-        route_detail_card(itinerary, choices, alerts, leg_amounts=leg_amounts, fare_notes=fare_notes),
+        ctx, sender, "Here's exactly how to make this trip.",
+        route_walkthrough_card(itinerary, alerts, leg_amounts=leg_amounts),
+    )
+
+    fare_lead = "Now, how would you like to pay?"
+    if options and options[0].estimated:
+        fare_lead += " Fares marked (est.) are approximate where an operator uses zone pricing."
+    fare_lead += (
+        " Stuck, or want a simpler explanation? Just ask - or say \"just pick for me\" "
+        "and I'll go with the cheapest option shown below."
+    )
+    await send_card(
+        ctx, sender, fare_lead,
+        route_detail_card(itinerary, choices, fare_notes=fare_notes),
     )
 
 
@@ -535,15 +552,25 @@ async def _send_trip_map(ctx: Context, sender: str, itinerary: dict[str, Any]) -
     Rendering (OSM tiles) and upload (Agentverse External Storage) are both
     genuine network calls that can fail; this must never block or fail the trip
     confirmation itself (diagnosis.md issue 7), matching the same best-effort
-    pattern already used for fares/alerts in ``_show_detail``.
+    pattern already used for fares/alerts in ``_show_detail``. The colour
+    legend and "open in Google Maps" link (ux-diagnosis.md issue D) need no
+    network call, so they still go out even if the image itself doesn't.
     """
     try:
-        resource = await build_trip_map_resource(ctx, sender, itinerary)
+        trip_map = await build_trip_map_resource(ctx, sender, itinerary)
     except Exception as exc:
         ctx.logger.error(f"[map] trip map failed: {exc}")
         return
-    if resource is not None:
-        await send_resource(ctx, sender, resource)
+
+    caption_lines = [line for line in (trip_map.legend,) if line]
+    if trip_map.maps_url:
+        caption_lines.append(f"Open in Google Maps for a live, pannable view: {trip_map.maps_url}")
+    caption = "\n".join(caption_lines)
+
+    if trip_map.resource is not None:
+        await send_resource(ctx, sender, trip_map.resource, caption)
+    elif caption:
+        await send_text(ctx, sender, caption)
 
 
 # ── Stage 5 - review & confirm (deferred-tool gate) ──────────────────────────
@@ -577,10 +604,7 @@ async def _show_review(ctx: Context, sender: str, state: dict[str, Any]) -> None
         await _search_routes(ctx, sender, state)
         return
 
-    route_name = " → ".join(
-        (leg.get("routeShortName") or leg.get("agencyName") or "?")
-        for leg in transit_legs(itinerary)
-    ) or "Walk the whole way"
+    route_name = route_title(itinerary)
     fare_label, fare_value = _selected_fare_display(state)
 
     summary_rows = [
@@ -631,7 +655,7 @@ async def _handle_confirm(ctx: Context, sender: str, text: str, state: dict[str,
             await send_card(
                 ctx,
                 sender,
-                "You're all set - here's exactly how to make each leg.",
+                "You're all set - confirmed! Here's the trip again for reference.",
                 final_itinerary_card(itinerary, fare_label, fare_value, leg_amounts=leg_amounts),
             )
             await _send_trip_map(ctx, sender, itinerary)
@@ -694,14 +718,11 @@ async def _resend_current_card(ctx: Context, sender: str, state: dict[str, Any],
         if itinerary is not None:
             await send_card(
                 ctx, sender, note,
-                route_detail_card(itinerary, _fare_choices_from_state(state), []),
+                route_detail_card(itinerary, _fare_choices_from_state(state)),
             )
     elif stage == AWAITING_CONFIRM:
         itinerary = _selected_itinerary(state)
-        route_name = " → ".join(
-            (leg.get("routeShortName") or leg.get("agencyName") or "?")
-            for leg in transit_legs(itinerary or {})
-        ) or "Walk the whole way"
+        route_name = route_title(itinerary or {})
         fare_label, fare_value = _selected_fare_display(state)
         rows = [
             {"label": "Route", "value": route_name},
@@ -754,8 +775,9 @@ async def _dispatch_paid(ctx: Context, sender: str, text: str, state: dict[str, 
 
     A structured card selection (JSON) fast-paths straight to the stage handler.
     Free text at a card stage first runs the cross-cutting interrupt classifier
-    (override / escalate / side_question / clarify) so the user can type past any
-    card at any point. INTAKE/DONE free text is always a (new) trip request.
+    (override / escalate / side_question / clarify / accept_default) so the user
+    can type past any card at any point. INTAKE/DONE free text is always a
+    (new) trip request.
     """
     stage = state.get("stage", INTAKE)
 
@@ -784,6 +806,8 @@ async def _dispatch_paid(ctx: Context, sender: str, text: str, state: dict[str, 
         await _resend_current_card(ctx, sender, state, note)
     elif result.intent == "clarify":
         await send_text(ctx, sender, result.reply or "Could you clarify what you'd like to do?")
+    elif result.intent == "accept_default":
+        await _handle_accept_default(ctx, sender, state)
     else:  # override
         await _handle_override(ctx, sender, text, state)
 
@@ -794,6 +818,36 @@ async def _handle_override(ctx: Context, sender: str, text: str, state: dict[str
     state["stage"] = INTAKE
     save_state(ctx, sender, state)
     await _handle_intake(ctx, sender, text, state)
+
+
+async def _handle_accept_default(ctx: Context, sender: str, state: dict[str, Any]) -> None:
+    """"Just pick for me": hand the current card's decision to the agent instead
+    of making the user evaluate it themselves (ux-diagnosis.md issue E).
+
+    Each stage already has a sensible default computed server-side - the
+    cheapest fare (``_show_detail``), the fastest route (badge-eligible in
+    ``route_carousel_card``) - this just acts on it via the same selection
+    shape a tap would send, so it goes through the exact same code path as a
+    real card interaction.
+    """
+    stage = state.get("stage")
+    if stage == SHOWING_DETAIL:
+        await _handle_detail(ctx, sender, json.dumps({"action": "continue_review"}), state)
+    elif stage == SHOWING_ROUTES:
+        itineraries = (state.get("last_itineraries") or {}).get("itineraries") or []
+        if not itineraries:
+            await _search_routes(ctx, sender, state)
+            return
+        durations = [it.get("duration", 0) or 0 for it in itineraries]
+        fastest_idx = durations.index(min(durations))
+        await _handle_routes(
+            ctx, sender, json.dumps({"action": "pick_route", "route_index": fastest_idx}), state
+        )
+    elif stage == AWAITING_CONFIRM:
+        await _handle_confirm(ctx, sender, json.dumps({"action": "confirm"}), state)
+    else:
+        await send_text(ctx, sender, "Sure - let's start with where you're headed.")
+        await start_intake(ctx, sender, state)
 
 
 # ── Protocol handlers ────────────────────────────────────────────────────────

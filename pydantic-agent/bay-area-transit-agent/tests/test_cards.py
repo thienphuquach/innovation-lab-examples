@@ -7,11 +7,13 @@ from __future__ import annotations
 import json
 
 from cards import (
-    _leg_instruction_rows,
+    _leg_step_items,
     _short_label,
     disambiguation_carousel_card,
     no_routes_recovery_card,
     route_carousel_card,
+    route_title,
+    route_walkthrough_card,
 )
 from models import GeocodeCandidate
 
@@ -68,8 +70,42 @@ def test_route_carousel_shows_boarding_headsign():
     assert "Board toward Richmond" in payload["items"][0]["subtitle"]
 
 
-# ── Issues 4 & 6: per-leg board/alight/fare instructions ─────────────────────
-def test_leg_instruction_rows_include_stops_headsign_and_fare():
+# ── Issue A: route titles must be plain-language, not line-color jargon ──────
+def test_route_title_uses_agency_and_mode_not_routeshortname():
+    itinerary = {
+        "legs": [
+            {"mode": "WALK", "transitLeg": False},
+            {"mode": "RAIL", "transitLeg": True, "routeShortName": "Red-S", "agencyName": "Bay Area Rapid Transit"},
+        ]
+    }
+    assert route_title(itinerary) == "BART train"
+
+
+def test_route_title_collapses_consecutive_same_agency_legs():
+    """A transfer between two BART lines is still just "BART" - the transfer
+    count is already shown elsewhere, so repeating the label twice adds noise
+    without adding information."""
+    itinerary = {
+        "legs": [
+            {"mode": "RAIL", "transitLeg": True, "routeShortName": "Orange-S", "agencyName": "Bay Area Rapid Transit"},
+            {"mode": "RAIL", "transitLeg": True, "routeShortName": "Yellow-S", "agencyName": "Bay Area Rapid Transit"},
+        ]
+    }
+    assert route_title(itinerary) == "BART train"
+
+
+def test_route_title_distinguishes_different_agencies():
+    itinerary = {
+        "legs": [
+            {"mode": "RAIL", "transitLeg": True, "routeShortName": "Red-S", "agencyName": "Bay Area Rapid Transit"},
+            {"mode": "BUS", "transitLeg": True, "routeShortName": "49", "agencyName": "San Francisco Municipal Transportation Agency"},
+        ]
+    }
+    assert route_title(itinerary) == "BART train → Muni bus"
+
+
+# ── Issues B & C: the walkthrough must read as a sequence, available pre-confirm ─
+def test_leg_step_items_lead_with_plain_language_and_keep_the_route_code():
     itinerary = {
         "legs": [
             {"mode": "WALK", "transitLeg": False, "from": {}, "to": {"name": "Powell St"}, "duration": 300},
@@ -77,6 +113,7 @@ def test_leg_instruction_rows_include_stops_headsign_and_fare():
                 "mode": "RAIL",
                 "transitLeg": True,
                 "routeShortName": "Yellow-N",
+                "agencyName": "Bay Area Rapid Transit",
                 "headsign": "Richmond",
                 "from": {"name": "Powell St"},
                 "to": {"name": "MacArthur"},
@@ -85,11 +122,41 @@ def test_leg_instruction_rows_include_stops_headsign_and_fare():
             },
         ]
     }
-    rows = _leg_instruction_rows(itinerary, leg_amounts=[2.50])
-    board_row = next(r for r in rows if r["label"].startswith("Board"))
-    assert "toward Richmond" in board_row["label"]
-    assert "Powell St" in board_row["value"] and "MacArthur" in board_row["value"]
-    assert "$2.50" in board_row["value"]
+    items = _leg_step_items(itinerary, leg_amounts=[2.50])
+    assert len(items) == 2  # one item per leg, in trip order - a sequence, not a flat table
+    walk_item, board_item = items
+    assert any(c["type"] == "text" and "Powell St" in c["value"] for c in walk_item["children"])
+
+    heading = next(c for c in board_item["children"] if c["type"] == "heading")
+    assert heading["value"] == "Board BART train toward Richmond"  # plain language, issue A
+    detail = next(c for c in board_item["children"] if c["type"] == "text")
+    assert "Powell St" in detail["value"] and "MacArthur" in detail["value"] and "$2.50" in detail["value"]
+    badge = next(c for c in board_item["children"] if c["type"] == "badge")
+    assert badge["label"] == "Yellow-N"  # the actual route code, kept for boarding time
+
+
+def test_route_walkthrough_card_is_a_terminal_custom_list_sequence():
+    """The walkthrough is its own card, sent separately from the fare/confirm
+    decision (issue B: sequence content shouldn't share a flat row list with a
+    payment choice) - and it's informational only (issue C: it goes out before
+    the user has to decide anything, not as a post-confirm recap)."""
+    itinerary = {
+        "legs": [
+            {
+                "mode": "RAIL", "transitLeg": True, "routeShortName": "R", "agencyName": "BART",
+                "from": {"name": "A"}, "to": {"name": "B"}, "startTime": 0, "endTime": 900000,
+            },
+        ]
+    }
+    meta = route_walkthrough_card(itinerary, ["Delay on Line 1"])
+    assert meta["card_kind"] == "custom"
+    assert meta["is_terminal"] == "true"
+    payload = json.loads(meta["card_payload"])
+    root = payload["root"]
+    assert root["type"] == "section"
+    kinds = [child["type"] for child in root["children"]]
+    assert "badge" in kinds  # the live alert
+    assert "list" in kinds  # the leg-by-leg sequence
 
 
 # ── Issue 2: zero-route recovery must name the actual failed trip ────────────

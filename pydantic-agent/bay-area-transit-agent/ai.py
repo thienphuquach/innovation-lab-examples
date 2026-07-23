@@ -107,13 +107,17 @@ async def extract_trip(text: str, *, model: Model | None = None) -> TripExtracti
 class IntentClassification(BaseModel):
     """How to handle a free-text message that isn't a structured card selection."""
 
-    intent: Literal["override", "escalate", "side_question", "clarify"] = Field(
+    intent: Literal["override", "escalate", "side_question", "clarify", "accept_default"] = Field(
         description=(
             "override: user states a different origin/destination than the one in "
             "progress. escalate: urgency ('now', 'stuck', 'cancelled', 'emergency') - "
             "wants the single fastest option immediately. side_question: a question "
             "about the current plan, not a new request. clarify: genuinely ambiguous "
-            "input that needs one direct question back."
+            "input that needs one direct question back. accept_default: the user "
+            "explicitly hands the current decision to the agent instead of choosing "
+            "themselves ('just pick for me', 'you decide', 'whatever's cheapest/"
+            "fastest is fine', 'I don't mind, you choose') - not the same as clarify, "
+            "since nothing here is ambiguous about what the user wants."
         )
     )
     reply: str = Field(

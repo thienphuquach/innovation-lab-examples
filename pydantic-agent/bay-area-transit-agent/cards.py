@@ -73,17 +73,24 @@ async def send_card(
     )
 
 
-async def send_resource(ctx: Context, sender: str, resource_content: Any) -> None:
-    """Send a ``ResourceContent`` block (e.g. the trip map image) as its own message.
+async def send_resource(
+    ctx: Context, sender: str, resource_content: Any, caption: str = ""
+) -> None:
+    """Send a ``ResourceContent`` block (e.g. the trip map image) as its own
+    message, with an optional narration bubble alongside it - e.g. the map's
+    colour legend and "open in Google Maps" link (ux-diagnosis.md issue D),
+    which the PNG itself can't carry.
 
     Kept separate from ``send_card`` since a ``ResourceContent`` is a different
     Chat Protocol content type, not card metadata (diagnosis.md issue 7).
     """
+    content: list[Any] = []
+    if caption:
+        content.append(TextContent(type="text", text=caption))
+    content.append(resource_content)
     await ctx.send(
         sender,
-        ChatMessage(
-            timestamp=datetime.now(timezone.utc), msg_id=uuid4(), content=[resource_content]
-        ),
+        ChatMessage(timestamp=datetime.now(timezone.utc), msg_id=uuid4(), content=content),
     )
 
 
@@ -251,15 +258,54 @@ def terminal_info_card(title: str, body: str) -> dict[str, str]:
 
 
 # ── Stage 3 - route search carousel ──────────────────────────────────────────
+# Route-selection titles must be readable with zero prior Bay Area transit
+# knowledge (ux-diagnosis.md issue A) - BART's ``routeShortName`` is an internal
+# line-color code ("Red-S") that means nothing to a newcomer deciding between
+# options, even though it's exactly what a rider *should* look for once they're
+# actually at the platform (kept, deliberately, in ``_leg_instruction_rows``).
+# Agencies whose live 511/Transitland ``agencyName`` is long or non-obvious get a
+# short, commonly recognized name; anything unmapped falls back to the agency
+# name as-is (verbose, but not cryptic - only BART's/Muni's official legal names
+# are actually unrecognizable to a rider).
+_AGENCY_SHORT_NAMES = {
+    "Bay Area Rapid Transit": "BART",
+    "San Francisco Municipal Transportation Agency": "Muni",
+    "AC TRANSIT": "AC Transit",
+}
+_MODE_NOUN = {"RAIL": "train", "SUBWAY": "train", "TRAM": "train", "BUS": "bus", "FERRY": "ferry", "BOAT": "ferry"}
+
+
+def _plain_leg_label(leg: dict[str, Any]) -> str:
+    """"BART train", "Muni bus" - agency + mode, not a route code."""
+    agency = _AGENCY_SHORT_NAMES.get(leg.get("agencyName") or "", leg.get("agencyName") or "Transit")
+    noun = _MODE_NOUN.get(leg.get("mode") or "", "")
+    if noun and noun not in agency.lower():
+        return f"{agency} {noun}"
+    return agency
+
+
 def _route_title(itinerary: dict[str, Any]) -> str:
+    """Plain-language title: agency+mode per leg, collapsing consecutive repeats.
+
+    A transfer between two BART lines (still "BART", just a different color code)
+    collapses to one label - the transfer count is already shown in the subtitle,
+    so no information is lost by not repeating "BART" twice.
+    """
     legs = transit_legs(itinerary)
     if not legs:
         return "Walk the whole way"
-    names = [
-        (leg.get("routeShortName") or leg.get("routeLongName") or leg.get("agencyName") or "?")
-        for leg in legs
-    ]
-    return " → ".join(names)
+    labels: list[str] = []
+    for leg in legs:
+        label = _plain_leg_label(leg)
+        if not labels or labels[-1] != label:
+            labels.append(label)
+    return " → ".join(labels)
+
+
+# Public aliases - chat_proto.py's Review/re-send cards and map_image.py's map
+# legend both need this same plain-language labeling, not a second copy of it.
+route_title = _route_title
+plain_leg_label = _plain_leg_label
 
 
 def _first_boarding_headsign(itinerary: dict[str, Any]) -> str | None:
@@ -325,59 +371,102 @@ def route_carousel_card(itineraries: list[dict[str, Any]], priority: str) -> dic
     return build_card_metadata("carousel", payload)
 
 
-# ── Stage 4 - route + fare detail ────────────────────────────────────────────
-def _leg_instruction_rows(
+# ── Stage 4 - the walkthrough (custom list) + fare/confirm (detail) ──────────
+def _leg_step_items(
     itinerary: dict[str, Any], leg_amounts: list[float | None] | None = None
-) -> list[dict[str, str]]:
-    """Per-leg board/alight/direction rows.
+) -> list[dict[str, Any]]:
+    """One ``custom``-card ``list`` item per leg, in trip order: walk, board,
+    walk, board, ... - a sequence a rider can follow, not a flat table to
+    decode (ux-diagnosis.md issue B).
 
-    Transitland already returns the boarding stop name, alight stop name, and
-    destination-facing ``headsign`` for every transit leg - none of it was ever
-    surfaced anywhere (diagnosis.md issues 4 & 5). ``leg_amounts``, if given, is
-    the chosen fare option's per-*transit*-leg cost (see ``fares.leg_breakdown``)
-    so the fare total is verifiable leg-by-leg, not just a single opaque number
-    (issue 6).
+    The heading leads with the plain-language mode/agency (``_plain_leg_label``,
+    issue A) so deciding "does this leg make sense to me" never requires
+    decoding a line-color code first; the actual route code, which *is* what a
+    rider needs once they're at the platform, stays visible as a badge on the
+    same step. ``leg_amounts``, if given, is the chosen fare option's per-leg
+    cost, so the total is verifiable leg-by-leg (issue 6, prior pass).
     """
-    rows = []
+    items: list[dict[str, Any]] = []
     transit_idx = 0
     for leg in itinerary.get("legs", []):
         frm = leg.get("from") or {}
         to = leg.get("to") or {}
         if leg.get("transitLeg"):
-            route = (
-                leg.get("routeShortName") or leg.get("routeLongName")
-                or leg.get("agencyName") or "transit"
-            )
             headsign = leg.get("headsign")
-            label = f"Board {route}" + (f" toward {headsign}" if headsign else "")
-            value = (
+            heading = f"Board {_plain_leg_label(leg)}" + (f" toward {headsign}" if headsign else "")
+            detail = (
                 f"{frm.get('name') or 'boarding point'} ({epoch_ms_to_clock(leg.get('startTime'))}) "
                 f"→ {to.get('name') or 'alight point'} ({epoch_ms_to_clock(leg.get('endTime'))})"
             )
             if leg_amounts and transit_idx < len(leg_amounts) and leg_amounts[transit_idx] is not None:
-                value += f" · ${leg_amounts[transit_idx]:.2f}"
+                detail += f" · ${leg_amounts[transit_idx]:.2f}"
             transit_idx += 1
+            children: list[dict[str, Any]] = [
+                {"type": "heading", "value": heading, "level": 3},
+                {"type": "text", "value": detail, "style": "muted"},
+            ]
+            route_code = leg.get("routeShortName") or leg.get("routeLongName")
+            if route_code:
+                children.append({"type": "badge", "label": str(route_code), "variant": "info"})
         else:
             dest = to.get("name")
-            label = "Walk"
-            value = f"to {dest}" if dest else fmt_duration(leg.get("duration"))
-        rows.append({"label": label, "value": value})
-    return rows
+            walk_text = f"Walk to {dest}" if dest else f"Walk ({fmt_duration(leg.get('duration'))})"
+            children = [{"type": "text", "value": walk_text, "style": "body"}]
+        items.append({"children": children})
+    return items
+
+
+def route_walkthrough_card(
+    itinerary: dict[str, Any],
+    alerts: list[str],
+    *,
+    leg_amounts: list[float | None] | None = None,
+) -> dict[str, str]:
+    """The Stage 4 ``custom`` list-sequence card: "how to make this trip."
+
+    Sent as its own message *before* the fare/confirm card - so this, the
+    clearest explanation of what the trip actually involves, is available at
+    the point a rider is deciding whether to proceed, not only after they've
+    already confirmed (ux-diagnosis.md issue C). ``is_terminal`` because it's
+    read-only; the Confirm/Back decision lives on the card sent right after it.
+    """
+    legs = itinerary.get("legs", [])
+    start = legs[0].get("startTime") if legs else None
+    end = legs[-1].get("endTime") if legs else None
+    n = itinerary.get("transfers", 0) or 0
+    subtitle = (
+        f"{fmt_duration(itinerary.get('duration'))} · {n} transfer{'s' if n != 1 else ''} · "
+        f"{epoch_ms_to_clock(start)}–{epoch_ms_to_clock(end)}"
+    )
+    children: list[dict[str, Any]] = [
+        {"type": "badge", "label": f"⚠ {alert}", "variant": "warning"} for alert in alerts
+    ]
+    children.append({"type": "list", "items": _leg_step_items(itinerary, leg_amounts)})
+    payload = {
+        "root": {
+            "type": "section",
+            "title": f"How to make this trip: {_route_title(itinerary)}",
+            "subtitle": subtitle,
+            "children": children,
+        }
+    }
+    return build_card_metadata("custom", payload, is_terminal=True)
 
 
 def route_detail_card(
     itinerary: dict[str, Any],
     fare_choices: list[dict[str, Any]],
-    alerts: list[str],
     *,
-    leg_amounts: list[float | None] | None = None,
     fare_notes: list[str] | None = None,
 ) -> dict[str, str]:
-    """Build the Stage 4 ``detail`` card: summary rows + fare radio + live alerts.
+    """Build the Stage 4 ``detail`` card: trip summary + fare radio + confirm.
 
-    ``leg_amounts`` (chosen option's per-leg cost) and ``fare_notes`` (why a
-    payment method that was considered isn't offered, e.g. "Cash isn't accepted
-    on BART") make the total verifiable instead of a single opaque figure.
+    The step-by-step walkthrough now lives on ``route_walkthrough_card``, sent
+    right before this one - this card is just the payment decision itself, so
+    it isn't competing with sequential content for the same flat row list
+    (ux-diagnosis.md issue B). ``fare_notes`` (why a payment method that was
+    considered isn't offered, e.g. "Cash isn't accepted on BART") stays here
+    since it directly explains this card's own choices.
     """
     legs = itinerary.get("legs", [])
     start = legs[0].get("startTime") if legs else None
@@ -391,14 +480,11 @@ def route_detail_card(
         {"label": "Transfers", "value": str(n)},
         {"label": "Duration", "value": fmt_duration(itinerary.get("duration"))},
     ]
-    for alert in alerts:
-        summary_rows.append({"label": "⚠ Alert", "value": alert})
-    summary_rows.extend(_leg_instruction_rows(itinerary, leg_amounts))
     for note in fare_notes or []:
         summary_rows.append({"label": "Fare note", "value": note})
 
     payload: dict[str, Any] = {
-        "title": "Route & fares",
+        "title": "How would you like to pay?",
         "summary_rows": summary_rows,
         "ctas": [
             {"label": "Confirm this trip", "selection": {"action": "continue_review"}, "primary": True},
@@ -409,7 +495,7 @@ def route_detail_card(
         payload["sub_options"] = {
             "name": "fare",
             "kind": "radio",
-            "label": "How to pay (cheapest first)",
+            "label": "How to pay (cheapest option first - already selected below)",
             "choices": fare_choices,
         }
     else:
@@ -440,28 +526,34 @@ def final_itinerary_card(
     *,
     leg_amounts: list[float | None] | None = None,
 ) -> dict[str, str]:
-    """Terminal ``detail`` card summarizing the confirmed trip.
+    """Terminal ``custom`` card recapping the confirmed trip as a step sequence.
 
-    Includes the per-leg board/alight/direction breakdown (diagnosis.md issues 4
-    & 5) - this is the moment a traveler most needs concrete "board here, get off
-    here, look for this direction" guidance, and previously got none of it.
+    Same list-sequence rendering as ``route_walkthrough_card`` (issue B) - this
+    is also the card the urgent/``escalate`` path sends directly (skipping the
+    walkthrough entirely, by design), so it must stand on its own with the full
+    per-leg board/alight/direction breakdown, not just a recap.
     """
     legs = itinerary.get("legs", [])
     start = legs[0].get("startTime") if legs else None
     end = legs[-1].get("endTime") if legs else None
     n = itinerary.get("transfers", 0) or 0
-    rows = [
-        {"label": "Route", "value": _route_title(itinerary)},
-        {"label": "Departure", "value": epoch_ms_to_clock(start)},
-        {"label": "Arrival", "value": epoch_ms_to_clock(end)},
-        {"label": "Duration", "value": fmt_duration(itinerary.get("duration"))},
-        {"label": "Transfers", "value": str(n)},
-    ]
+    subtitle = (
+        f"{fmt_duration(itinerary.get('duration'))} · {n} transfer{'s' if n != 1 else ''} · "
+        f"{epoch_ms_to_clock(start)}–{epoch_ms_to_clock(end)}"
+    )
+    children: list[dict[str, Any]] = []
     if fare_label and fare_value:
-        rows.append({"label": "Fare", "value": f"{fare_label} · {fare_value}"})
-    rows.extend(_leg_instruction_rows(itinerary, leg_amounts))
-    payload = {"title": "Trip confirmed 🎉", "summary_rows": rows}
-    return build_card_metadata("detail", payload, is_terminal=True)
+        children.append({"type": "text", "value": f"Fare: {fare_label} · {fare_value}", "style": "emphasis"})
+    children.append({"type": "list", "items": _leg_step_items(itinerary, leg_amounts)})
+    payload = {
+        "root": {
+            "type": "section",
+            "title": f"Trip confirmed 🎉 — {_route_title(itinerary)}",
+            "subtitle": subtitle,
+            "children": children,
+        }
+    }
+    return build_card_metadata("custom", payload, is_terminal=True)
 
 
 def no_routes_recovery_card(origin_text: str, destination_text: str) -> dict[str, str]:

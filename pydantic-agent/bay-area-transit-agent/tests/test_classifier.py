@@ -13,7 +13,7 @@ from uagents_core.contrib.protocols.chat import ChatMessage, MetadataContent, Te
 
 import chat_proto
 from ai import IntentResult, classify_intent
-from session_state import DONE, INTAKE, SHOWING_DETAIL, SHOWING_ROUTES, get_state
+from session_state import AWAITING_CONFIRM, DONE, INTAKE, SHOWING_DETAIL, SHOWING_ROUTES, get_state
 
 pytestmark = pytest.mark.asyncio
 
@@ -88,7 +88,7 @@ async def test_escalate_gives_fastest_terminal(ctx, sender, monkeypatch):
     monkeypatch.setattr(chat_proto, "classify_intent", fake)
     state = _routes_state(ctx, sender)
     await chat_proto._dispatch_paid(ctx, sender, "my train got cancelled, I need the fastest now", state)
-    metas = _cards(ctx, "detail")
+    metas = _cards(ctx, "custom")  # final_itinerary_card is now a custom list-sequence card
     assert metas and metas[0].get("is_terminal") == "true"
     assert get_state(ctx, sender)["stage"] == DONE
 
@@ -134,6 +134,48 @@ async def test_override_clears_trip_and_reintakes(ctx, sender, monkeypatch):
     assert saved["trip"] is None  # old trip dropped
     assert saved["paid"] is True  # unlock preserved, no re-charge
     assert _cards(ctx, "form")
+
+
+# ── accept_default: "just pick for me" hands the decision to the agent ──────
+# (ux-diagnosis.md issue E - a low-effort default path, not a forced
+# self-serve comparison, at whichever stage the user is currently on).
+async def test_accept_default_at_routes_picks_the_fastest_itinerary(ctx, sender, monkeypatch):
+    async def fake(*a, **k):
+        return IntentResult(intent="accept_default", reply="", history_json="[]")
+
+    monkeypatch.setattr(chat_proto, "classify_intent", fake)
+    state = _routes_state(ctx, sender, stage=SHOWING_ROUTES)
+    await chat_proto._dispatch_paid(ctx, sender, "you decide, I don't mind", state)
+    saved = get_state(ctx, sender)
+    assert saved["stage"] == SHOWING_DETAIL
+    assert saved["selected_route_id"] == "0"  # the 1611s itinerary, not the 3000s one
+
+
+async def test_accept_default_at_detail_confirms_with_the_precomputed_cheapest_fare(
+    ctx, sender, monkeypatch
+):
+    async def fake(*a, **k):
+        return IntentResult(intent="accept_default", reply="", history_json="[]")
+
+    monkeypatch.setattr(chat_proto, "classify_intent", fake)
+    state = _routes_state(ctx, sender, stage=SHOWING_DETAIL)
+    await chat_proto._dispatch_paid(ctx, sender, "just pick for me", state)
+    saved = get_state(ctx, sender)
+    assert saved["stage"] == AWAITING_CONFIRM
+    assert saved["selected_fare_option"] == "clipper"  # untouched - the precomputed default
+    assert _cards(ctx, "review")
+
+
+async def test_accept_default_at_awaiting_confirm_just_confirms(ctx, sender, monkeypatch):
+    async def fake(*a, **k):
+        return IntentResult(intent="accept_default", reply="", history_json="[]")
+
+    monkeypatch.setattr(chat_proto, "classify_intent", fake)
+    state = _routes_state(ctx, sender, stage=AWAITING_CONFIRM)
+    await chat_proto._dispatch_paid(ctx, sender, "whatever, you choose", state)
+    saved = get_state(ctx, sender)
+    assert saved["stage"] == DONE
+    assert _cards(ctx, "custom")  # the confirmed-trip recap
 
 
 async def test_classifier_failure_defaults_to_override(ctx, sender, monkeypatch):
