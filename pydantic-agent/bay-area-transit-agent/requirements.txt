@@ -18,6 +18,9 @@ httpx>=0.27.0
 # GTFS-Realtime protobuf decoding (511 TripUpdates / ServiceAlerts)
 gtfs-realtime-bindings>=1.0.0
 
+# Confirmed-trip map image - renders OSM tiles + itinerary polyline (issue 7)
+staticmap>=0.5.7
+
 # Utilities
 python-dotenv>=1.0.0
 

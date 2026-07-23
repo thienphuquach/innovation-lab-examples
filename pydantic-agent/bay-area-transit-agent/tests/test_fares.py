@@ -43,23 +43,26 @@ def _legs(*route_ids):
 
 def test_clipper_beats_cash_via_transfer_discount():
     fd = _two_network_fd()
-    opts = compute_fare_options(_legs("SF:1", "AC:51"), fd)
+    opts, notes = compute_fare_options(_legs("SF:1", "AC:51"), fd)
     by_id = {o.id: o for o in opts}
     assert opts[0].id == "clipper"  # cheapest first
     assert by_id["clipper"].amount == 3.25  # 2.50 + 0.75 transfer
     assert by_id["cash"].amount == 5.50  # 3.00 + 2.50, no cash transfer rule
     assert by_id["clipper"].estimated is True  # a transfer discount was applied
+    # Both payment methods priced fine; the only note is the (accurate) day-pass
+    # ineligibility, since this itinerary spans two operators.
+    assert len(notes) == 1 and "day pass" in notes[0].lower()
 
 
 def test_walking_only_has_no_fare_options():
-    assert compute_fare_options([{"mode": "WALK", "transitLeg": False}], _two_network_fd()) == []
+    assert compute_fare_options([{"mode": "WALK", "transitLeg": False}], _two_network_fd()) == ([], [])
 
 
 def test_single_network_offers_day_pass():
     fd = _two_network_fd()
     fd.leg_rules["muni"].append(LegRule("", "", "muni_grp", "muni-1-day", False))
     fd.products["muni-1-day"] = [_p(5.00, "clipper", is_pass=True)]
-    opts = compute_fare_options(_legs("SF:1"), fd)
+    opts, _ = compute_fare_options(_legs("SF:1"), fd)
     assert "daypass" in {o.id for o in opts}
 
 
@@ -69,8 +72,33 @@ def test_distance_based_network_is_estimated():
     fd = FareData(
         route_network={"BA:R": "bart"}, leg_rules={"bart": rules}, products=products
     )
-    opts = compute_fare_options(_legs("BA:R"), fd)
+    opts, _ = compute_fare_options(_legs("BA:R"), fd)
     assert opts and opts[0].estimated is True
+
+
+def test_unpriceable_leg_no_longer_kills_the_whole_option():
+    """A leg with zero fare products at all (e.g. a free shuttle) is treated as a
+    $0/included leg, not a reason to discard every payment method for the whole
+    itinerary (diagnosis.md issue 6)."""
+    fd = _two_network_fd()
+    fd.route_network["SI:Shuttle"] = "shuttle"  # no leg_rules/products for "shuttle" at all
+    opts, _ = compute_fare_options(_legs("SI:Shuttle", "SF:1"), fd)
+    by_id = {o.id: o for o in opts}
+    assert "clipper" in by_id
+    assert by_id["clipper"].amount == 2.50  # just the Muni leg; shuttle leg contributes $0
+    assert by_id["clipper"].unpriced_legs == 1
+    assert by_id["clipper"].leg_amounts == [None, 2.50]
+
+
+def test_media_genuinely_unsupported_drops_option_with_a_note():
+    """A network that has fare data but never a cash-media row (e.g. real BART)
+    should still drop Cash entirely - but explain why, not just vanish."""
+    fd = _two_network_fd()
+    fd.products["ac-single"] = [_p(2.50, "clipper")]  # AC Transit: no cash row at all now
+    opts, notes = compute_fare_options(_legs("SF:1", "AC:51"), fd)
+    ids = {o.id for o in opts}
+    assert "cash" not in ids
+    assert any("cash" in n.lower() and "actransit" in n.lower() for n in notes)
 
 
 # ── Stage 4 dispatch ─────────────────────────────────────────────────────────

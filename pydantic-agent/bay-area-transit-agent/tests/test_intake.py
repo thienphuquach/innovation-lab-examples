@@ -116,6 +116,9 @@ async def test_ambiguous_origin_shows_carousel_then_pick(ctx, sender, monkeypatc
     assert _cards(ctx, "carousel"), "expected a disambiguation carousel"
     saved = get_state(ctx, sender)
     assert saved["pending_trip"]["origin_coords"] is None
+    # Both candidates are kept for a possible zero-route retry later (issue 1),
+    # not just the one the user ends up picking.
+    assert len(saved["geocode_alternates"]["origin"]) == 2
 
     # User picks the CA Berkeley.
     ctx.sent.clear()

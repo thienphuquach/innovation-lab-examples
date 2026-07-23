@@ -44,9 +44,13 @@ def default_state() -> dict[str, Any]:
         "message_history": None,  # ModelMessagesTypeAdapter.dump_json string
         "trip": None,  # normalized TripRequest dict (Stage 2), fully geocoded
         "pending_trip": None,  # trip mid-geocoding (Stage 2.5), coords being resolved
+        "geocode_alternates": None,  # {"origin"/"destination": [candidate dicts]} - the
+        # other matches from Stage 2.5 disambiguation, kept so a zero-route Stage 3
+        # search can retry a nearby candidate before giving up (diagnosis.md issue 1)
         "last_itineraries": None,  # cached Transitland plan (Stage 3), enables Back
         "selected_route_id": None,
         "fare_options": None,  # cached FareOption dicts (Stage 4)
+        "fare_notes": None,  # why a considered payment method isn't offered (Stage 4)
         "selected_fare_option": None,
         "pending_approval": None,  # deferred-tool handle (Stage 5)
         # ── internal payment bookkeeping ──
@@ -80,9 +84,11 @@ def clear_trip_state(state: dict[str, Any]) -> None:
     """
     state["trip"] = None
     state["pending_trip"] = None
+    state["geocode_alternates"] = None
     state["last_itineraries"] = None
     state["selected_route_id"] = None
     state["fare_options"] = None
+    state["fare_notes"] = None
     state["selected_fare_option"] = None
     state["pending_approval"] = None
 

@@ -14,7 +14,7 @@ Stage 2 intake.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from uagents import Context, Protocol
@@ -31,12 +31,14 @@ from cards import (
     extract_text,
     final_itinerary_card,
     intake_form_card,
+    no_routes_recovery_card,
     parse_selection,
     review_card,
     route_carousel_card,
     route_detail_card,
     routing_error_card,
     send_card,
+    send_resource,
     send_text,
     terminal_info_card,
 )
@@ -44,7 +46,8 @@ from clients.five11 import alerts_for_routes, load_fare_data
 from clients.geocode import resolve_place
 from clients.transitland import RoutingError, plan, transit_legs
 from fares import compute_fare_options
-from models import depart_option_to_iso, new_trip, validate_trip_texts
+from map_image import build_trip_map_resource
+from models import BAY_AREA_TZ, depart_option_to_iso, new_trip, now_local, validate_trip_texts
 from payment import confirm_payment_via_text, request_payment
 from session_state import (
     AWAITING_CONFIRM,
@@ -110,6 +113,21 @@ async def _handle_unpaid(ctx: Context, sender: str, text: str, state: dict[str, 
     await request_payment(ctx, sender, state)
 
 
+def _push_depart_time(depart_iso: str | None, *, minutes: int) -> str:
+    """``depart_iso`` (or now, if unset/unparseable/already past) plus ``minutes``."""
+    now = now_local()
+    base = now
+    if depart_iso:
+        try:
+            dt = datetime.fromisoformat(depart_iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=BAY_AREA_TZ)
+            base = max(dt, now)
+        except ValueError:
+            base = now
+    return (base + timedelta(minutes=minutes)).isoformat()
+
+
 # ── Stage 2 - trip intake (form + free-text paths) ───────────────────────────
 async def _handle_intake(ctx: Context, sender: str, text: str, state: dict[str, Any]) -> None:
     """Collect a trip request from either the form card or free text.
@@ -118,13 +136,32 @@ async def _handle_intake(ctx: Context, sender: str, text: str, state: dict[str, 
     message either picks a candidate or retypes the place being resolved.
     """
     selection = parse_selection(text)
+    action = selection.get("action")
 
     # Mid-geocoding: a carousel pick resolves the current field.
-    if state.get("pending_trip") and selection.get("action") == "pick_place":
+    if state.get("pending_trip") and action == "pick_place":
         await _apply_place_pick(ctx, sender, state, selection)
         return
 
-    if selection.get("action") == "submit_trip":
+    # Recovery-card actions from a just-failed zero-route search (diagnosis.md
+    # issue 2) - the trip's already-resolved origin/destination survive in
+    # ``state["trip"]`` specifically so these can act on it without re-asking.
+    if action == "new_trip":
+        clear_trip_state(state)
+        await start_intake(ctx, sender, state)
+        return
+    if action == "retry_later":
+        trip = state.get("trip")
+        if not trip or not trip.get("origin_coords") or not trip.get("destination_coords"):
+            await start_intake(ctx, sender, state)
+            return
+        trip["depart_time"] = _push_depart_time(trip.get("depart_time"), minutes=30)
+        state["trip"] = trip
+        save_state(ctx, sender, state)
+        await _search_routes(ctx, sender, state)
+        return
+
+    if action == "submit_trip":
         origin = str(selection.get("origin", "") or "")
         destination = str(selection.get("destination", "") or "")
         priority = str(selection.get("priority", "fastest") or "fastest")
@@ -204,7 +241,17 @@ async def _resolve_next_field(ctx: Context, sender: str, state: dict[str, Any]) 
         await _resolve_next_field(ctx, sender, state)
         return
 
-    # Ambiguous -> ask the user to pick.
+    # Ambiguous -> ask the user to pick. Keep every candidate (not just the one
+    # picked) so a zero-route Stage 3 search can retry a sibling candidate before
+    # giving up (diagnosis.md issue 1 - Nominatim can return multiple points for
+    # one landmark, not all of which are actually transit-reachable).
+    alternates = state.setdefault("geocode_alternates", {}) or {}
+    alternates[field] = [
+        {"lat": c.lat, "lon": c.lon, "label": c.label} for c in candidates
+    ]
+    state["geocode_alternates"] = alternates
+    save_state(ctx, sender, state)
+
     where = "starting point" if field == "origin" else "destination"
     await send_card(
         ctx,
@@ -248,6 +295,51 @@ async def _finalize_trip(ctx: Context, sender: str, state: dict[str, Any]) -> No
 
 
 # ── Stage 3 - route search (carousel) ────────────────────────────────────────
+async def _retry_with_alternate_candidate(
+    ctx: Context, sender: str, state: dict[str, Any]
+) -> tuple[dict[str, Any], str] | None:
+    """On a zero-itinerary result, retry once against a sibling geocode candidate.
+
+    Nominatim can return several points for one landmark query, not all of which
+    are actually transit-reachable (diagnosis.md issue 1 - e.g. two of four
+    "Golden Gate Bridge" matches sit on the bridge's own motorway deck, which is
+    correctly unroutable on foot, while the other two are the real vista-point
+    stops). Only the endpoint(s) that were genuinely ambiguous have alternates
+    recorded (see ``_resolve_next_field``), so this is at most a couple of extra
+    Transitland calls, only in the already-rare zero-result case.
+
+    Returns ``(plan_obj, note)`` on success, or ``None`` if no alternate helped.
+    """
+    trip = state.get("trip") or {}
+    alternates = state.get("geocode_alternates") or {}
+    for field in ("origin", "destination"):
+        candidates = alternates.get(field) or []
+        current_coords = trip.get(f"{field}_coords")
+        for cand in candidates:
+            alt_coords = [cand["lat"], cand["lon"]]
+            if alt_coords == current_coords:
+                continue
+            origin = alt_coords if field == "origin" else trip.get("origin_coords")
+            dest = alt_coords if field == "destination" else trip.get("destination_coords")
+            # Both were already set for the just-failed search this retry follows.
+            assert origin is not None and dest is not None
+            try:
+                plan_obj = await plan(origin, dest, trip.get("depart_time"))
+            except RoutingError:
+                continue
+            if plan_obj.get("itineraries"):
+                trip[f"{field}_coords"] = alt_coords
+                trip[f"{field}_text"] = cand.get("label", trip.get(f"{field}_text"))
+                state["trip"] = trip
+                where = "starting point" if field == "origin" else "destination"
+                note = (
+                    f'Note: the {where} you picked has no reachable transit stop nearby, '
+                    f'so I used "{cand.get("label")}" instead.'
+                )
+                return plan_obj, note
+    return None
+
+
 async def _search_routes(ctx: Context, sender: str, state: dict[str, Any]) -> None:
     """Call Transitland and render the itinerary carousel (cached for Back)."""
     trip = state.get("trip")
@@ -270,17 +362,24 @@ async def _search_routes(ctx: Context, sender: str, state: dict[str, Any]) -> No
         return
 
     itineraries = plan_obj.get("itineraries") or []
+    swap_note = None
+    if not itineraries:
+        retried = await _retry_with_alternate_candidate(ctx, sender, state)
+        if retried:
+            plan_obj, swap_note = retried
+            itineraries = plan_obj.get("itineraries") or []
+            trip = state["trip"]  # _retry_with_alternate_candidate updated coords/text
+
     if not itineraries:
         await send_card(
             ctx,
             sender,
-            "No routes found for that time.",
-            terminal_info_card(
-                "No routes found",
-                "I couldn't find any transit for that time. Try a different departure time.",
-            ),
+            f'No routes found from "{trip["origin_text"]}" to "{trip["destination_text"]}" '
+            "for that time.",
+            no_routes_recovery_card(trip["origin_text"], trip["destination_text"]),
         )
-        await start_intake(ctx, sender, state)
+        state["stage"] = INTAKE
+        save_state(ctx, sender, state)
         return
 
     state["last_itineraries"] = plan_obj  # cached so Back needs no re-fetch
@@ -292,6 +391,8 @@ async def _search_routes(ctx: Context, sender: str, state: dict[str, Any]) -> No
         "Here's a walking route." if n == 1 and not _has_transit(itineraries[0])
         else f"Found {n} option{'s' if n != 1 else ''}."
     )
+    if swap_note:
+        lead = f"{swap_note} {lead}"
     await send_card(
         ctx, sender, lead, route_carousel_card(itineraries, trip.get("priority", "fastest"))
     )
@@ -351,10 +452,10 @@ async def _show_detail(ctx: Context, sender: str, state: dict[str, Any]) -> None
 
     try:
         fare_data = await load_fare_data()
-        options = compute_fare_options(itinerary.get("legs", []), fare_data)
+        options, fare_notes = compute_fare_options(itinerary.get("legs", []), fare_data)
     except Exception as exc:  # fares are best-effort; never block the trip on them
         ctx.logger.error(f"[stage4] fare computation failed: {exc}")
-        options = []
+        options, fare_notes = [], []
 
     legs = transit_legs(itinerary)
     route_ids = {rid for leg in legs if (rid := leg.get("routeId"))}
@@ -363,9 +464,16 @@ async def _show_detail(ctx: Context, sender: str, state: dict[str, Any]) -> None
 
     choices = [o.to_choice() for o in options]
     state["fare_options"] = [
-        {"id": o.id, "label": o.label, "amount": o.amount, "estimated": o.estimated}
+        {
+            "id": o.id,
+            "label": o.label,
+            "amount": o.amount,
+            "estimated": o.estimated,
+            "leg_amounts": o.leg_amounts,
+        }
         for o in options
     ]
+    state["fare_notes"] = fare_notes
     # Default the selection to the cheapest option (options are sorted).
     state["selected_fare_option"] = options[0].id if options else None
     state["stage"] = SHOWING_DETAIL
@@ -374,7 +482,11 @@ async def _show_detail(ctx: Context, sender: str, state: dict[str, Any]) -> None
     lead = "Here's the route with fares and any live alerts."
     if options and options[0].estimated:
         lead += " Fares marked (est.) are approximate where an operator uses zone pricing."
-    await send_card(ctx, sender, lead, route_detail_card(itinerary, choices, alerts))
+    leg_amounts = options[0].leg_amounts if options else None
+    await send_card(
+        ctx, sender, lead,
+        route_detail_card(itinerary, choices, alerts, leg_amounts=leg_amounts, fare_notes=fare_notes),
+    )
 
 
 async def _handle_detail(ctx: Context, sender: str, text: str, state: dict[str, Any]) -> None:
@@ -417,6 +529,23 @@ async def _handle_detail(ctx: Context, sender: str, text: str, state: dict[str, 
     await _handle_intake(ctx, sender, text, state)
 
 
+async def _send_trip_map(ctx: Context, sender: str, itinerary: dict[str, Any]) -> None:
+    """Best-effort: render + upload the confirmed trip's map, then send it.
+
+    Rendering (OSM tiles) and upload (Agentverse External Storage) are both
+    genuine network calls that can fail; this must never block or fail the trip
+    confirmation itself (diagnosis.md issue 7), matching the same best-effort
+    pattern already used for fares/alerts in ``_show_detail``.
+    """
+    try:
+        resource = await build_trip_map_resource(ctx, sender, itinerary)
+    except Exception as exc:
+        ctx.logger.error(f"[map] trip map failed: {exc}")
+        return
+    if resource is not None:
+        await send_resource(ctx, sender, resource)
+
+
 # ── Stage 5 - review & confirm (deferred-tool gate) ──────────────────────────
 def _selected_fare_display(state: dict[str, Any]) -> tuple[str | None, str | None]:
     """Return (label, price string) for the chosen fare, or (None, None) if none."""
@@ -428,6 +557,17 @@ def _selected_fare_display(state: dict[str, Any]) -> tuple[str | None, str | Non
     )
     price = f"${chosen['amount']:.2f}" + (" (est.)" if chosen.get("estimated") else "")
     return chosen["label"], price
+
+
+def _selected_fare_leg_amounts(state: dict[str, Any]) -> list[float | None] | None:
+    """Per-leg costs for the currently-chosen fare option, if any (for issue-6 breakdowns)."""
+    options = state.get("fare_options") or []
+    if not options:
+        return None
+    chosen = next(
+        (o for o in options if o["id"] == state.get("selected_fare_option")), options[0]
+    )
+    return chosen.get("leg_amounts")
 
 
 async def _show_review(ctx: Context, sender: str, state: dict[str, Any]) -> None:
@@ -487,12 +627,14 @@ async def _handle_confirm(ctx: Context, sender: str, text: str, state: dict[str,
         itinerary = _selected_itinerary(state)
         fare_label, fare_value = _selected_fare_display(state)
         if itinerary is not None:
+            leg_amounts = _selected_fare_leg_amounts(state)
             await send_card(
                 ctx,
                 sender,
-                "You're all set - have a great trip! Message me anytime to plan another.",
-                final_itinerary_card(itinerary, fare_label, fare_value),
+                "You're all set - here's exactly how to make each leg.",
+                final_itinerary_card(itinerary, fare_label, fare_value, leg_amounts=leg_amounts),
             )
+            await _send_trip_map(ctx, sender, itinerary)
         # Stage 6: keep paid + message_history, drop trip state, ready for the next one.
         clear_trip_state(state)
         state["stage"] = DONE

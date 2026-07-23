@@ -96,7 +96,7 @@ async def test_routing_error_shows_error_card(ctx, sender, monkeypatch):
     assert any(cta["selection"]["action"] == "retry_routing" for cta in payload.get("ctas", []))
 
 
-async def test_zero_itineraries_terminal_and_reshow(ctx, sender, monkeypatch):
+async def test_zero_itineraries_shows_specific_recovery_card(ctx, sender, monkeypatch):
     async def empty(o, d, t, **k):
         return {"itineraries": []}
 
@@ -104,9 +104,74 @@ async def test_zero_itineraries_terminal_and_reshow(ctx, sender, monkeypatch):
     state = _routes_state(ctx, sender)
     await chat_proto._search_routes(ctx, sender, state)
 
-    assert _cards(ctx, "detail"), "expected terminal no-routes card"
-    assert _cards(ctx, "form"), "expected the intake form to be re-shown"
-    assert get_state(ctx, sender)["stage"] == INTAKE
+    metas = _cards(ctx, "detail")
+    assert metas, "expected the no-routes recovery card"
+    payload = json.loads(metas[0]["card_payload"])
+    # The recovery card names the actual trip that failed (diagnosis.md issue 2),
+    # not a generic reset - and offers concrete next steps.
+    values = {row["label"]: row["value"] for row in payload["summary_rows"]}
+    assert values["From"] == "Berkeley"
+    assert values["To"] == "Powell St"
+    actions = {cta["selection"]["action"] for cta in payload["ctas"]}
+    assert actions == {"retry_later", "new_trip"}
+    # No blank form is auto-shown; the trip context is preserved for those CTAs.
+    assert not _cards(ctx, "form")
+    saved = get_state(ctx, sender)
+    assert saved["stage"] == INTAKE
+    assert saved["trip"]["origin_text"] == "Berkeley"
+
+
+async def test_zero_itineraries_retries_alternate_geocode_candidate(ctx, sender, monkeypatch):
+    """diagnosis.md issue 1: a picked candidate with no reachable transit (e.g. a
+    point on a bridge's own motorway deck) should fall back to a sibling
+    candidate from the same disambiguation before giving up."""
+    state = _routes_state(ctx, sender)
+    state["geocode_alternates"] = {
+        "destination": [
+            {"lat": 37.78, "lon": -122.41, "label": "Powell St"},  # == current, skipped
+            {"lat": 37.9, "lon": -122.5, "label": "A working alternate"},
+        ]
+    }
+
+    calls = []
+
+    async def flaky_plan(o, d, t, **k):
+        calls.append((tuple(o), tuple(d)))
+        if tuple(d) == (37.9, -122.5):
+            return _fake_plan()
+        return {"itineraries": []}
+
+    monkeypatch.setattr(chat_proto, "plan", flaky_plan)
+    await chat_proto._search_routes(ctx, sender, state)
+
+    assert len(calls) == 2  # original + exactly one alternate retry
+    assert _cards(ctx, "carousel"), "expected the retry to succeed and show routes"
+    saved = get_state(ctx, sender)
+    assert saved["trip"]["destination_coords"] == [37.9, -122.5]
+    assert saved["trip"]["destination_text"] == "A working alternate"
+
+
+async def test_retry_later_action_pushes_depart_time_and_researches(ctx, sender, monkeypatch):
+    state = _routes_state(ctx, sender)
+    state["stage"] = INTAKE  # as left by the no-routes recovery card
+
+    async def fake_plan(o, d, t, **k):
+        return _fake_plan()
+
+    monkeypatch.setattr(chat_proto, "plan", fake_plan)
+    await chat_proto._handle_intake(ctx, sender, json.dumps({"action": "retry_later"}), state)
+
+    assert _cards(ctx, "carousel")
+    assert get_state(ctx, sender)["trip"] is not None  # trip context kept, not wiped
+
+
+async def test_new_trip_action_clears_state_and_shows_blank_form(ctx, sender):
+    state = _routes_state(ctx, sender)
+    state["stage"] = INTAKE
+    await chat_proto._handle_intake(ctx, sender, json.dumps({"action": "new_trip"}), state)
+
+    assert _cards(ctx, "form")
+    assert get_state(ctx, sender)["trip"] is None
 
 
 async def test_pick_route_advances_to_detail(ctx, sender, monkeypatch):

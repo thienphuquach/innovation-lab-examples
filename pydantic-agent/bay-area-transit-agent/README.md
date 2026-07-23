@@ -13,7 +13,10 @@ This agent is a reference fusion of two Innovation Lab patterns: the
 [`stripe-horoscope-agent`](../../stripe-horoscope-agent) payment gate and the
 card-driven flow of [`news-card-agent`](../../news-card-agent). See
 [`research-notes.md`](./research-notes.md) for the wire-protocol details and every
-place the live docs differed from the original brief.
+place the live docs differed from the original brief, and
+[`diagnosis.md`](./diagnosis.md) for the round-2 live-testing findings (zero-route
+recovery, disambiguation, per-leg instructions, fare breakdown, and the map image)
+behind several of the behaviors below.
 
 > **Test mode only.** The agent refuses to start unless `STRIPE_SECRET_KEY` /
 > `STRIPE_PUBLISHABLE_KEY` are Stripe **test** keys. No real money ever moves.
@@ -28,7 +31,7 @@ place the live docs differed from the original brief.
 | 2.5 — Geocoding | Resolve text to coordinates (Transitland stops → Nominatim fallback) | `carousel` for disambiguation |
 | 3 — Routes | Transitland itineraries with Fastest / Fewest-transfers / Long-wait badges | `carousel` |
 | 4 — Route + fares | Fare-by-payment-method + live 511 GTFS-RT alerts for the chosen route | `detail` card |
-| 5 — Review & confirm | A Pydantic AI `requires_approval=True` deferred tool gates the finalize step | `review` card |
+| 5 — Review & confirm | A Pydantic AI `requires_approval=True` deferred tool gates the finalize step; the confirmation includes a per-leg board/alight/direction breakdown plus a self-hosted map image of the route | `review` card, then a terminal `detail` card + image |
 | 6 — Repeat use | A finished session keeps the paid unlock and re-enters intake on the next message | — |
 | Cross-cutting | An interrupt classifier lets a user type past any card at any stage (override / escalate / side-question / clarify) | — |
 
@@ -46,9 +49,12 @@ place the live docs differed from the original brief.
 | `Transitland_APIs` | Free REST key: https://www.transit.land/documentation (used for stop/station geocoding) |
 | `Transitland_Routing_API` | A **separate** subscription on the same account — order the "Transitland Routing API - Beta" plan (1,000 free queries/month) |
 | `sf_bay_511_api` | Free self-serve token: https://511.org/open-data/token (covers all Bay Area operators + Fares v2, `operator_id=RG`) |
+| `AGENTVERSE_API_KEY` *(optional)* | https://agentverse.ai/profile/api-keys — only needed for the confirmed-trip map image. Without it, the trip confirmation still sends normally, just with no map attached. |
 
 Nominatim (the geocoding fallback) needs no key; the client sends a descriptive
-`User-Agent` and rate-limits itself per the OSM usage policy.
+`User-Agent` and rate-limits itself per the OSM usage policy. The trip map image
+(rendered from free OSM raster tiles via the `staticmap` library, then uploaded to
+Agentverse External Storage) follows the same policy via `OSM_TILE_USER_AGENT`.
 
 ## Local setup
 
@@ -96,9 +102,12 @@ All tests run fully offline — no ASI:One, Stripe, 511, Transitland, or Nominat
 calls. Pydantic AI agents are driven by `TestModel`/`FunctionModel`, network
 clients are monkeypatched, and `ctx` is an in-memory fake. Coverage spans the
 payment gate, intake + geocoding (resolved / ambiguous / not-found), the routing
-carousel, the fare engine (Clipper transfer discounts, day passes, estimated
-zone fares), the `requires_approval` finalize gate (defer / approve / deny), and
-the interrupt classifier (fast-path + all four intents + graceful degradation).
+carousel (including the zero-route recovery + alternate-geocode retry), card
+label/instruction builders, the fare engine (Clipper transfer discounts, day
+passes, estimated zone fares, partial pricing with explicit unsupported-method
+notes), the `requires_approval` finalize gate (defer / approve / deny), the trip
+map image (polyline decode + best-effort render/upload failure handling), and the
+interrupt classifier (fast-path + all four intents + graceful degradation).
 
 ## Project layout
 
@@ -109,6 +118,7 @@ payment.py          Agent Payment Protocol seller role + Stripe checkout/verify
 ai.py               Pydantic AI: trip extraction, intent classifier, finalize gate
 cards.py            Interactive-card builders + shared send/parse helpers
 fares.py            GTFS-Fares v2 fare engine (per payment method)
+map_image.py        Confirmed-trip map image (polyline render + External Storage upload)
 models.py           Trip models + time/format helpers
 session_state.py    Per-sender session schema in ctx.storage
 clients/
@@ -116,5 +126,6 @@ clients/
   transitland.py    Transitland routing client (cached)
   five11.py         511 regional GTFS + Fares v2 + GTFS-RT alerts
 research-notes.md   Mandatory-research findings + doc discrepancies
+diagnosis.md        Round-2 live-testing investigation (root causes, pre-fix)
 tests/              Offline test suite
 ```
