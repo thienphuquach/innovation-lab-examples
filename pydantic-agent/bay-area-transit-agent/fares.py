@@ -1,15 +1,21 @@
 """Fare computation over an itinerary's leg sequence (GTFS-Fares v2).
 
-Given the transit legs of a chosen itinerary, compute the total cost by payment
-method - Clipper (electronic), Cash, and a single-operator Day pass when one
-applies - using the real 511 regional Fares v2 data (:mod:`clients.five11`).
+Given the transit legs of a chosen itinerary, compute what the trip costs to tap
+through, using the real 511 regional Fares v2 data (:mod:`clients.five11`).
 
-The leg sequence matters: consecutive legs get Clipper transfer discounts via
-``fare_transfer_rules`` (which is why Clipper usually beats cash on multi-leg
-trips). Distance/zone-based fares (BART's ~2,450 station-pair matrix) can't be
-joined to the routing feed's stop IDs across feeds, so those legs are priced from
-a representative fare and the whole option is flagged **Estimated** rather than
-presenting false precision. See ``research-notes.md`` §6-7.
+Two payment methods are offered - a Clipper card and a contactless bank card or
+mobile wallet - and they always cost the same, because since Clipper 2.0 they are
+the same fare product from the rider's side (see ``clients.five11.TAP_MEDIA``).
+Cash is not modelled at all: every Clipper agency takes a tap, and the handful of
+operators that take neither (Capitol Corridor, ACE, a few small ferries) are
+reported as unpriceable rather than quietly priced in cash the rider can't
+actually use at a gate.
+
+The leg sequence matters: consecutive legs get transfer discounts via
+``fare_transfer_rules``. Distance/zone-based fares (BART's ~2,450 station-pair
+matrix) can't be joined to the routing feed's stop IDs across feeds, so those legs
+are priced from a representative fare and the total is flagged **Estimated**
+rather than presenting false precision. See ``research-notes.md`` §6-7.
 """
 
 from __future__ import annotations
@@ -18,11 +24,7 @@ import statistics
 from dataclasses import dataclass
 from typing import Any
 
-from clients.five11 import (
-    CASH_MEDIA,
-    CLIPPER_MEDIA,
-    FareData,
-)
+from clients.five11 import TAP_MEDIA, FareData
 
 # A network whose single-ride product set is larger than this is treated as
 # distance/zone-based (e.g. BART's station-pair matrix) -> estimated.
@@ -31,7 +33,7 @@ _DISTANCE_BASED_THRESHOLD = 30
 
 @dataclass
 class FareOption:
-    id: str  # "clipper" | "cash" | "daypass"
+    id: str  # "clipper" | "contactless"
     label: str
     amount: float
     currency: str
@@ -109,41 +111,26 @@ def _transfer_amount(
     return min(amounts) if amounts else None
 
 
-def _day_pass(fd: FareData, network_id: str, rider: str) -> tuple[float, str] | None:
-    pids = {
-        r.fare_product_id
-        for r in fd.leg_rules.get(network_id, [])
-        if any(k in r.fare_product_id.lower() for k in ("daypass", "1-day", ":day"))
-    }
-    best: tuple[float, str] | None = None
-    for pid in pids:
-        for mg in (CLIPPER_MEDIA, CASH_MEDIA):
-            a = _amount_for(fd, pid, rider, mg)
-            if a is not None and (best is None or a < best[0]):
-                best = (a, pid)
-    return (round(best[0], 2), best[1]) if best else None
-
-
 def compute_fare_options(
     legs: list[dict[str, Any]], fd: FareData, *, rider: str = "adult"
 ) -> tuple[list[FareOption], list[str]]:
-    """Compute payment options for an itinerary's legs, cheapest first.
+    """Price an itinerary's legs and return the ways to pay for it.
 
-    Returns ``([], [])`` for a walking-only itinerary (no fare to pay).
+    Returns ``([], [])`` for a walking-only itinerary (no fare to pay), and two
+    equally-priced options - Clipper and a contactless bank card - for anything
+    that can be tapped through end to end.
 
-    The second return value explains why any payment method that was *considered*
-    isn't offered - e.g. "Cash isn't accepted on Bay Area Rapid Transit" - so a
-    missing option reads as a deliberate, verified answer rather than a silent
-    computation failure (diagnosis.md issue 6).
+    The second return value explains why the trip *can't* be tapped when that
+    happens - e.g. "Capitol Corridor doesn't accept Clipper or a contactless bank
+    card" - so an empty option list reads as a deliberate, verified answer rather
+    than a silent computation failure (diagnosis.md issue 6).
 
     A single leg with no fare data at all (``_leg_fare`` status ``"free"`` - e.g. a
-    free airport shuttle with no published fare product) no longer discards the
-    whole option; it's treated as a $0/included leg and the rest of the itinerary
-    still prices normally. A leg where the network *does* publish fares but none of
-    them accept the payment method being priced (status ``"unsupported"`` - e.g.
-    BART has no cash/ticket-media product at all) still correctly drops that whole
-    option, since that payment method genuinely cannot be used for this trip - but
-    now says so via ``notes`` instead of just vanishing.
+    free airport shuttle with no published fare product) doesn't discard the
+    result; it's treated as a $0/included leg and the rest of the itinerary still
+    prices normally. A leg on a network that publishes fares but accepts no tap
+    media (status ``"unsupported"``) does drop the whole thing, since the rider
+    genuinely cannot tap their way through this trip.
     """
     transit = [leg for leg in legs if leg.get("transitLeg")]
     if not transit:
@@ -152,68 +139,59 @@ def compute_fare_options(
     nets = [fd.route_network.get(leg.get("routeId", "")) for leg in transit]
     leg_groups = [fd.net_leg_group(n) if n else None for n in nets]
 
-    options: list[FareOption] = []
     notes: list[str] = []
-    for opt_id, media_group in (("clipper", CLIPPER_MEDIA), ("cash", CASH_MEDIA)):
-        label = "Clipper" if opt_id == "clipper" else "Cash"
-        total = 0.0
-        estimated = False
-        priced = True
-        unpriced_legs = 0
-        leg_amounts: list[float | None] = []
-        for i, net in enumerate(nets):
-            agency = transit[i].get("agencyName") or net or "this route"
-            if not net:
-                notes.append(f"{label}: no fare data available for {agency}")
-                priced = False
-                break
-            status, fare, est = _leg_fare(fd, net, rider, media_group)
-            if status == "unsupported":
-                notes.append(f"{label} isn't accepted on {agency}")
-                priced = False
-                break
-            if status == "free":
-                # No fare product at all for this leg (e.g. a free airport shuttle) -
-                # assume no charge rather than discarding the whole option over one
-                # leg we simply have no data for.
-                leg_amounts.append(None)
-                unpriced_legs += 1
-                estimated = True
-                continue
-            assert fare is not None
-            estimated = estimated or est
-            prev_lg = leg_groups[i - 1] if i > 0 else None
-            cur_lg = leg_groups[i]
-            if prev_lg and cur_lg:
-                discount = _transfer_amount(fd, prev_lg, cur_lg, rider, media_group)
-                # A transfer rule replaces the leg's own fare (free/discounted/credit).
-                # Floor at 0 - some rows encode a credit as a negative amount - and
-                # flag the option estimated, since transfer semantics are approximate.
-                if discount is not None and discount < fare:
-                    fare = max(discount, 0.0)
-                    estimated = True
-            leg_amounts.append(fare)
-            total += fare
-        if priced:
-            options.append(
-                FareOption(
-                    opt_id,
-                    label,
-                    round(total, 2),
-                    "USD",
-                    estimated,
-                    leg_amounts=leg_amounts,
-                    unpriced_legs=unpriced_legs,
-                )
+    total = 0.0
+    estimated = False
+    unpriced_legs = 0
+    leg_amounts: list[float | None] = []
+    for i, net in enumerate(nets):
+        agency = transit[i].get("agencyName") or net or "this route"
+        if not net:
+            notes.append(f"No fare data available for {agency}")
+            return [], notes
+        status, fare, est = _leg_fare(fd, net, rider, TAP_MEDIA)
+        if status == "unsupported":
+            notes.append(
+                f"{agency} doesn't accept Clipper or a contactless bank card - "
+                "buy a ticket from the operator for that leg"
             )
+            return [], notes
+        if status == "free":
+            # No fare product at all for this leg (e.g. a free airport shuttle) -
+            # assume no charge rather than discarding the whole trip over one leg
+            # we simply have no data for.
+            leg_amounts.append(None)
+            unpriced_legs += 1
+            estimated = True
+            continue
+        assert fare is not None
+        estimated = estimated or est
+        prev_lg = leg_groups[i - 1] if i > 0 else None
+        cur_lg = leg_groups[i]
+        if prev_lg and cur_lg:
+            discount = _transfer_amount(fd, prev_lg, cur_lg, rider, TAP_MEDIA)
+            # A transfer rule replaces the leg's own fare (free/discounted/credit).
+            # Floor at 0 - some rows encode a credit as a negative amount - and
+            # flag the total estimated, since transfer semantics are approximate.
+            if discount is not None and discount < fare:
+                fare = max(discount, 0.0)
+                estimated = True
+        leg_amounts.append(fare)
+        total += fare
 
-    uniq_nets = {n for n in nets if n}
-    if len(uniq_nets) == 1:
-        dp = _day_pass(fd, next(iter(uniq_nets)), rider)
-        if dp:
-            options.append(FareOption("daypass", "Day pass", dp[0], "USD", False))
-    elif len(uniq_nets) > 1:
-        notes.append("Day pass: not offered - this trip uses more than one operator")
-
-    options.sort(key=lambda o: o.amount)
+    # One computed fare, two ways to pay it. Clipper leads because it's the only
+    # one that also carries discounted (senior/youth/disabled) fares; a bank card
+    # always charges the full adult fare.
+    options = [
+        FareOption(
+            opt_id,
+            label,
+            round(total, 2),
+            "USD",
+            estimated,
+            leg_amounts=leg_amounts,
+            unpriced_legs=unpriced_legs,
+        )
+        for opt_id, label in (("clipper", "Clipper card"), ("contactless", "Contactless bank card"))
+    ]
     return options, notes

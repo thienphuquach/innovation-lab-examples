@@ -45,7 +45,6 @@ async def test_form_submit_resolves_and_finalizes(ctx, sender, monkeypatch):
             "action": "submit_trip",
             "origin": "Berkeley",
             "destination": "Mission",
-            "depart_option": "now",
             "priority": "cheapest",
         }
     )
@@ -65,7 +64,6 @@ async def test_form_same_origin_destination_reshows_form(ctx, sender):
             "action": "submit_trip",
             "origin": "SF",
             "destination": "sf",
-            "depart_option": "now",
             "priority": "fastest",
         }
     )
@@ -78,7 +76,7 @@ async def test_form_same_origin_destination_reshows_form(ctx, sender):
 async def test_free_text_path_uses_extraction(ctx, sender, monkeypatch):
     async def fake_extract(text):
         return TripExtraction(
-            origin="Berkeley", destination="Mission", depart_time_iso=None, priority="fastest"
+            origin="Berkeley", destination="Mission", priority="fastest"
         )
 
     monkeypatch.setattr(chat_proto, "extract_trip", fake_extract)
@@ -108,7 +106,6 @@ async def test_ambiguous_origin_shows_carousel_then_pick(ctx, sender, monkeypatc
             "action": "submit_trip",
             "origin": "Berkeley",
             "destination": "Mission",
-            "depart_option": "now",
             "priority": "fastest",
         }
     )
@@ -143,7 +140,6 @@ async def test_not_found_shows_terminal_and_reshows_form(ctx, sender, monkeypatc
             "action": "submit_trip",
             "origin": "asdkfjqwoeixyz",
             "destination": "Mission",
-            "depart_option": "now",
             "priority": "fastest",
         }
     )
@@ -161,7 +157,6 @@ async def test_extract_trip_wiring_with_testmodel():
         custom_output_args={
             "origin": "Berkeley",
             "destination": "Mission",
-            "depart_time_iso": None,
             "priority": "cheapest",
         }
     )

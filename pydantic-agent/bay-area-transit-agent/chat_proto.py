@@ -15,7 +15,7 @@ Stage 2 intake.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from uagents import Context, Protocol
@@ -26,12 +26,20 @@ from uagents_core.contrib.protocols.chat import (
     chat_protocol_spec,
 )
 
-from ai import classify_intent, extract_trip, resume_finalize, start_finalize
+from ai import (
+    answer_fare_question,
+    classify_intent,
+    extract_trip,
+    resume_finalize,
+    start_finalize,
+)
 from cards import (
     disambiguation_carousel_card,
     extract_text,
+    fare_narration_lines,
     final_itinerary_card,
     intake_form_card,
+    no_fare_labels,
     no_routes_recovery_card,
     parse_selection,
     review_card,
@@ -50,8 +58,8 @@ from clients.geocode import resolve_place
 from clients.transitland import RoutingError, plan, transit_legs
 from fares import compute_fare_options
 from map_image import build_trip_map_resource
-from models import BAY_AREA_TZ, depart_option_to_iso, new_trip, now_local, validate_trip_texts
-from payment import confirm_payment_via_text, request_payment
+from models import epoch_ms_to_clock, fmt_duration, new_trip, validate_trip_texts
+from payment import clear_watch, request_payment, settle_or_request_payment
 from session_state import (
     AWAITING_CONFIRM,
     DONE,
@@ -65,10 +73,6 @@ from session_state import (
 )
 
 chat_proto = Protocol(spec=chat_protocol_spec)
-
-# Text a user might type to force a manual payment re-check (fallback path only;
-# normally ASI:One sends CommitPayment automatically once Stripe settles).
-_PAID_WORDS = {"paid", "done", "i paid", "paid!", "finished", "complete", "completed"}
 
 
 # ── Stage 2 entry (called from here and from payment._grant_access) ───────────
@@ -92,8 +96,9 @@ async def start_intake(
         narration = f"{error} Let's try again - fill in the form or describe your trip."
     elif welcome:
         narration = (
-            "Payment confirmed - you're unlocked! Where are you headed? Fill in the trip "
-            'form, or just tell me in your own words (e.g. "Berkeley to the Mission at 6pm"). '
+            "Payment confirmed! Where are you headed? Fill in the trip "
+            'form, or just tell me in your own words (e.g. "Berkeley to the Mission"). '
+            "I'll plan it departing right now. \n\n"
             "New to Bay Area transit? At any point, just ask me to explain something, or say "
             '"you decide" / "pick for me" and I\'ll go with a sensible default.'
         )
@@ -103,34 +108,84 @@ async def start_intake(
 
 
 # ── Stage 0 - payment gate ───────────────────────────────────────────────────
-async def _handle_unpaid(ctx: Context, sender: str, text: str, state: dict[str, Any]) -> None:
-    """Gate every unpaid message. No functionality is reachable before payment."""
-    if text.lower().strip() in _PAID_WORDS:
-        if await confirm_payment_via_text(ctx, sender):
-            return
-        await send_text(
-            ctx,
-            sender,
-            "I don't see a completed payment yet. Please finish the Stripe checkout above.",
-        )
+# A cheap, local check so an LLM call only happens for messages that actually
+# look like a question - the common pre-payment cases (a greeting, an attempted
+# trip request) skip straight to the gate, no extra latency or cost.
+_QUESTION_STARTERS = (
+    "what", "how", "why", "where", "when", "who",
+    "do i", "does", "is ", "are ", "can i", "should i", "will ",
+)
+# Phrases that read as a request for explanation wherever they appear in the
+# message, not just as a sentence opener - e.g. "I still don't know anything
+# about Clipper, can you explain" (observed live: the mid-flow LLM interrupt
+# classifier misread this exact phrasing as "override" instead of
+# "side_question", wiping the trip already in progress). Kept to specific,
+# multi-word phrases rather than single common words like "is"/"are", which
+# would otherwise also match plain statements ("This is the wallet I use").
+_EXPLANATION_PHRASES = (
+    "can you explain", "could you explain", "can you tell me",
+    "could you tell me", "don't know", "dont know", "not sure",
+    "no idea", "explain how", "explain what", "tell me about",
+    "tell me more",
+)
+# Scopes the pre-payment Q&A to fare/Clipper topics specifically - deliberately
+# narrower than "any question". Without this, something like "How do I get from
+# Berkeley to the Mission?" would also match _looks_like_a_question and get
+# routed to an LLM with no route data, which could hallucinate a plausible-
+# sounding but fabricated transit answer. That's both a real "no functionality
+# before payment" violation and a wrong-information risk, so a question that
+# doesn't mention a fare/payment topic falls straight through to the gate
+# instead, same as any other pre-payment message.
+_FARE_QUESTION_KEYWORDS = (
+    "clipper", "fare", "pay", "card", "tap", "cash", "cost", "price",
+    "ticket", "contactless", "wallet", "charge", "refund", "discount",
+)
+
+
+def _looks_like_a_fare_question(text: str) -> bool:
+    t = text.strip().lower()
+    is_question = (
+        t.endswith("?")
+        or t.startswith(_QUESTION_STARTERS)
+        or any(p in t for p in _EXPLANATION_PHRASES)
+    )
+    return is_question and any(k in t for k in _FARE_QUESTION_KEYWORDS)
+
+
+async def _handle_unpaid(ctx: Context, sender: str, text: str) -> None:
+    """Gate every unpaid message. No functionality is reachable before payment.
+
+    Reads state itself, fresh, rather than trusting a value the caller read
+    earlier: the background Stripe poller can grant access between that read
+    and this call (e.g. while a prior turn's own LLM call was in flight), and a
+    rider who just paid must not be held up answering a question they no
+    longer need to ask.
+
+    Otherwise, a genuine fare/Clipper question (e.g. "what is Clipper", "do I
+    need a physical card") gets a short, grounded answer instead of just
+    re-showing the gate silently again - a first-time rider shouldn't be left
+    guessing about how paying even works. The answer is sent as its own
+    text-only reply and the gate is *not* re-sent in the same turn:
+    ``RequestPayment`` must go out with no accompanying text or ASI:One drops
+    the native payment sheet (payment.py), so the question is answered against
+    the card already on screen, not a fresh one. Anything else - a greeting, an
+    attempted trip request, a question unrelated to paying, or the Q&A call
+    being unavailable - falls straight through to the gate, unchanged.
+    """
+    state = get_state(ctx, sender)
+    if state.get("paid"):
+        await _dispatch_paid(ctx, sender, text, state)
         return
-    # Any other message => (re)issue a fresh Stripe checkout gate.
-    await request_payment(ctx, sender, state)
-
-
-def _push_depart_time(depart_iso: str | None, *, minutes: int) -> str:
-    """``depart_iso`` (or now, if unset/unparseable/already past) plus ``minutes``."""
-    now = now_local()
-    base = now
-    if depart_iso:
+    if _looks_like_a_fare_question(text):
         try:
-            dt = datetime.fromisoformat(depart_iso)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=BAY_AREA_TZ)
-            base = max(dt, now)
-        except ValueError:
-            base = now
-    return (base + timedelta(minutes=minutes)).isoformat()
+            reply = (await answer_fare_question(text)).strip()
+        except Exception as exc:  # never let a Q&A hiccup block the payment gate
+            reply = ""
+            ctx.logger.error(f"[payment] fare Q&A failed, gating as usual: {exc}")
+        if reply:
+            await send_text(ctx, sender, f"{reply} Pay above to unlock trip planning.")
+            return
+    await settle_or_request_payment(ctx, sender, state)
 
 
 # ── Stage 2 - trip intake (form + free-text paths) ───────────────────────────
@@ -148,46 +203,22 @@ async def _handle_intake(ctx: Context, sender: str, text: str, state: dict[str, 
         await _apply_place_pick(ctx, sender, state, selection)
         return
 
-    # Recovery-card actions from a just-failed zero-route search (diagnosis.md
-    # issue 2) - the trip's already-resolved origin/destination survive in
-    # ``state["trip"]`` specifically so these can act on it without re-asking.
+    # Recovery-card action from a just-failed zero-route search (diagnosis.md
+    # issue 2).
     if action == "new_trip":
         clear_trip_state(state)
         await start_intake(ctx, sender, state)
-        return
-    if action == "retry_later":
-        trip = state.get("trip")
-        if not trip or not trip.get("origin_coords") or not trip.get("destination_coords"):
-            await start_intake(ctx, sender, state)
-            return
-        trip["depart_time"] = _push_depart_time(trip.get("depart_time"), minutes=30)
-        state["trip"] = trip
-        save_state(ctx, sender, state)
-        await _search_routes(ctx, sender, state)
         return
 
     if action == "submit_trip":
         origin = str(selection.get("origin", "") or "")
         destination = str(selection.get("destination", "") or "")
         priority = str(selection.get("priority", "fastest") or "fastest")
-        depart_time = depart_option_to_iso(selection.get("depart_option"))
-        if selection.get("depart_option") == "custom" and depart_time is None:
-            # We can't invent a time; ask for it (free-text extractor handles it).
-            state["pending_trip"] = None
-            save_state(ctx, sender, state)
-            await send_text(
-                ctx,
-                sender,
-                "Sure - what time? Tell me the whole trip with a time, e.g. "
-                '"Berkeley to the Mission at 6:15pm".',
-            )
-            return
     else:
         # Free-text path -> Pydantic AI structured extraction.
         extraction = await extract_trip(text)
         origin, destination = extraction.origin, extraction.destination
         priority = extraction.priority
-        depart_time = extraction.depart_time_iso
 
     error = validate_trip_texts(origin, destination)
     if error:
@@ -197,7 +228,6 @@ async def _handle_intake(ctx: Context, sender: str, text: str, state: dict[str, 
     state["pending_trip"] = new_trip(
         origin_text=origin,
         destination_text=destination,
-        depart_time=depart_time,
         priority=priority,
     )
     save_state(ctx, sender, state)
@@ -329,7 +359,7 @@ async def _retry_with_alternate_candidate(
             # Both were already set for the just-failed search this retry follows.
             assert origin is not None and dest is not None
             try:
-                plan_obj = await plan(origin, dest, trip.get("depart_time"))
+                plan_obj = await plan(origin, dest)
             except RoutingError:
                 continue
             if plan_obj.get("itineraries"):
@@ -353,9 +383,7 @@ async def _search_routes(ctx: Context, sender: str, state: dict[str, Any]) -> No
         return
 
     try:
-        plan_obj = await plan(
-            trip["origin_coords"], trip["destination_coords"], trip.get("depart_time")
-        )
+        plan_obj = await plan(trip["origin_coords"], trip["destination_coords"])
     except RoutingError as exc:
         ctx.logger.error(f"[stage3] routing error: {exc}")
         await send_card(
@@ -380,7 +408,7 @@ async def _search_routes(ctx: Context, sender: str, state: dict[str, Any]) -> No
             ctx,
             sender,
             f'No routes found from "{trip["origin_text"]}" to "{trip["destination_text"]}" '
-            "for that time.",
+            "departing right now.",
             no_routes_recovery_card(trip["origin_text"], trip["destination_text"]),
         )
         state["stage"] = INTAKE
@@ -479,7 +507,11 @@ async def _show_detail(ctx: Context, sender: str, state: dict[str, Any]) -> None
         for o in options
     ]
     state["fare_notes"] = fare_notes
-    # Default the selection to the cheapest option (options are sorted).
+    # Carried forward so the final confirm card (Stage 5) can still show it -
+    # without this it's fetched once here and then silently lost by confirm time.
+    state["alerts"] = alerts
+    # Default to Clipper, which leads the list because it's the only one that also
+    # carries discounted fares; a bank card always charges the full adult fare.
     state["selected_fare_option"] = options[0].id if options else None
     state["stage"] = SHOWING_DETAIL
     save_state(ctx, sender, state)
@@ -493,15 +525,16 @@ async def _show_detail(ctx: Context, sender: str, state: dict[str, Any]) -> None
         route_walkthrough_card(itinerary, alerts, leg_amounts=leg_amounts),
     )
 
-    fare_lead = "Now, how would you like to pay?"
-    if options and options[0].estimated:
-        fare_lead += " Fares marked (est.) are approximate where an operator uses zone pricing."
-    fare_lead += (
-        " Stuck, or want a simpler explanation? Just ask - or say \"just pick for me\" "
-        "and I'll go with the cheapest option shown below."
-    )
+    # Each fact on its own short line rather than one paragraph (a link plus a
+    # full sentence doesn't fit a card row without wrapping across several
+    # lines, which reads as a wall of text inside the card - ux follow-up).
+    # The classifier (ai.py) is what actually answers a rider's follow-up
+    # questions about any of this in more depth.
+    fare_lines = ["Payment Options"]
+    fare_lines.extend(fare_narration_lines(itinerary, choices))
+    fare_lines.append("Just ask if anything's unclear.")
     await send_card(
-        ctx, sender, fare_lead,
+        ctx, sender, "\n".join(fare_lines),
         route_detail_card(itinerary, choices, fare_notes=fare_notes),
     )
 
@@ -564,7 +597,7 @@ async def _send_trip_map(ctx: Context, sender: str, itinerary: dict[str, Any]) -
 
     caption_lines = [line for line in (trip_map.legend,) if line]
     if trip_map.maps_url:
-        caption_lines.append(f"Open in Google Maps for a live, pannable view: {trip_map.maps_url}")
+        caption_lines.append(f"\n Open in Google Maps for a live, pannable view: {trip_map.maps_url}")
     caption = "\n".join(caption_lines)
 
     if trip_map.resource is not None:
@@ -573,7 +606,31 @@ async def _send_trip_map(ctx: Context, sender: str, itinerary: dict[str, Any]) -
         await send_text(ctx, sender, caption)
 
 
-# ── Stage 5 - review & confirm (deferred-tool gate) ──────────────────────────
+def _trip_recap_line(
+    itinerary: dict[str, Any], fare_label: str | None, fare_value: str | None
+) -> str:
+    """A self-contained one-line summary of a confirmed trip.
+
+    ASI:One silently drops a card on any schema/size validation failure,
+    falling back to showing only its narration text (cards.py's own rule:
+    every narration must stand alone) - so the text sent alongside the final
+    itinerary card must carry the route, timing and fare itself, not just an
+    empty "all set!" that means nothing if the card underneath doesn't render.
+    """
+    legs = itinerary.get("legs", [])
+    n = itinerary.get("transfers", 0) or 0
+    start = epoch_ms_to_clock(legs[0].get("startTime") if legs else None)
+    end = epoch_ms_to_clock(legs[-1].get("endTime") if legs else None)
+    line = (
+        f"{route_title(itinerary)} · {fmt_duration(itinerary.get('duration'))} · "
+        f"{n} transfer{'s' if n != 1 else ''} · {start}\u2013{end}"
+    )
+    if fare_label and fare_value:
+        line += f" · Fare: {fare_label} {fare_value}"
+    return line
+
+
+# Stage 5 - review & confirm (deferred-tool gate) 
 def _selected_fare_display(state: dict[str, Any]) -> tuple[str | None, str | None]:
     """Return (label, price string) for the chosen fare, or (None, None) if none."""
     options = state.get("fare_options") or []
@@ -606,18 +663,20 @@ async def _show_review(ctx: Context, sender: str, state: dict[str, Any]) -> None
 
     route_name = route_title(itinerary)
     fare_label, fare_value = _selected_fare_display(state)
+    if fare_label is None:
+        fare_label, fare_value = no_fare_labels(itinerary)
 
     summary_rows = [
         {"label": "Route", "value": route_name},
-        {"label": "Fare option", "value": fare_label or "Walking - free"},
-        {"label": "Total", "value": fare_value or "$0.00"},
+        {"label": "Fare option", "value": fare_label},
+        {"label": "Total", "value": fare_value or ""},
     ]
 
     # Open the requires_approval gate: the finalize tool defers before running.
-    summary = f"{route_name} | {fare_label or 'walking'} {fare_value or ''}".strip()
+    summary = f"{route_name} | {fare_label} {fare_value or ''}".strip()
     try:
         start = await start_finalize(summary)
-        state["message_history"] = start.history_json
+        state["finalize_history"] = start.history_json
         state["pending_approval"] = (
             {"tool_call_id": start.tool_call_id} if start.deferred else None
         )
@@ -628,7 +687,7 @@ async def _show_review(ctx: Context, sender: str, state: dict[str, Any]) -> None
     state["stage"] = AWAITING_CONFIRM
     save_state(ctx, sender, state)
     await send_card(
-        ctx, sender, "One last look - confirm to lock it in.", review_card(summary_rows)
+        ctx, sender, "Here is your trip summary. Please confirm to lock it in.", review_card(summary_rows)
     )
 
 
@@ -638,7 +697,7 @@ async def _handle_confirm(ctx: Context, sender: str, text: str, state: dict[str,
     action = selection.get("action")
     pending = state.get("pending_approval") or {}
     tool_call_id = pending.get("tool_call_id")
-    history = state.get("message_history")
+    history = state.get("finalize_history")
 
     if action == "confirm":
         if tool_call_id and history:
@@ -652,11 +711,14 @@ async def _handle_confirm(ctx: Context, sender: str, text: str, state: dict[str,
         fare_label, fare_value = _selected_fare_display(state)
         if itinerary is not None:
             leg_amounts = _selected_fare_leg_amounts(state)
+            alerts = state.get("alerts") or []
             await send_card(
                 ctx,
                 sender,
-                "You're all set - confirmed! Here's the trip again for reference.",
-                final_itinerary_card(itinerary, fare_label, fare_value, leg_amounts=leg_amounts),
+                f"Your trip has been confirmed: {_trip_recap_line(itinerary, fare_label, fare_value)}",
+                final_itinerary_card(
+                    itinerary, fare_label, fare_value, leg_amounts=leg_amounts, alerts=alerts
+                ),
             )
             await _send_trip_map(ctx, sender, itinerary)
         # Stage 6: keep paid + message_history, drop trip state, ready for the next one.
@@ -680,11 +742,7 @@ async def _handle_confirm(ctx: Context, sender: str, text: str, state: dict[str,
     # Free text at the review card: treat as a new/overridden trip request.
     await _handle_intake(ctx, sender, text, state)
 
-
-# ── Cross-cutting interrupt classifier ───────────────────────────────────────
-# Card stages where a free-text message might be an interrupt rather than a
-# selection. At INTAKE/DONE free text is always just a (new) trip request.
-_CARD_STAGES = {SHOWING_ROUTES, SHOWING_DETAIL, AWAITING_CONFIRM}
+_CARD_STAGES = {SHOWING_ROUTES, SHOWING_DETAIL, AWAITING_CONFIRM, DONE}
 
 
 def _stage_handler(stage: str):
@@ -724,10 +782,12 @@ async def _resend_current_card(ctx: Context, sender: str, state: dict[str, Any],
         itinerary = _selected_itinerary(state)
         route_name = route_title(itinerary or {})
         fare_label, fare_value = _selected_fare_display(state)
+        if fare_label is None:
+            fare_label, fare_value = no_fare_labels(itinerary or {})
         rows = [
             {"label": "Route", "value": route_name},
-            {"label": "Fare option", "value": fare_label or "Walking - free"},
-            {"label": "Total", "value": fare_value or "$0.00"},
+            {"label": "Fare option", "value": fare_label},
+            {"label": "Total", "value": fare_value or ""},
         ]
         await send_card(ctx, sender, note, review_card(rows))
     else:
@@ -745,9 +805,7 @@ async def _handle_escalate(ctx: Context, sender: str, text: str, state: dict[str
             await _handle_intake(ctx, sender, text, state)
             return
         try:
-            plan_obj = await plan(
-                trip["origin_coords"], trip["destination_coords"], trip.get("depart_time")
-            )
+            plan_obj = await plan(trip["origin_coords"], trip["destination_coords"])
             itineraries = plan_obj.get("itineraries") or []
             state["last_itineraries"] = plan_obj
         except RoutingError as exc:
@@ -755,7 +813,11 @@ async def _handle_escalate(ctx: Context, sender: str, text: str, state: dict[str
             await send_card(ctx, sender, "The trip planner didn't respond.", routing_error_card())
             return
     if not itineraries:
-        await send_text(ctx, sender, "I couldn't find any transit right now - try a different time.")
+        await send_text(
+            ctx,
+            sender,
+            "I couldn't find any transit running between those two points right now.",
+        )
         return
 
     fastest = min(itineraries, key=lambda it: it.get("duration", 0) or 0)
@@ -764,12 +826,12 @@ async def _handle_escalate(ctx: Context, sender: str, text: str, state: dict[str
     await send_card(
         ctx,
         sender,
-        "In a hurry - here's the fastest option right now:",
+        f"In a hurry - fastest option right now: {_trip_recap_line(fastest, None, None)}",
         final_itinerary_card(fastest, None, None),
     )
 
 
-# ── Paid-stage dispatch (Stages 2-6) ─────────────────────────────────────────
+# Paid-stage dispatch (Stages 2-6) 
 async def _dispatch_paid(ctx: Context, sender: str, text: str, state: dict[str, Any]) -> None:
     """Route a paid user's message by current stage (Stages 2-6).
 
@@ -783,6 +845,12 @@ async def _dispatch_paid(ctx: Context, sender: str, text: str, state: dict[str, 
 
     # Fast path: a structured selection dispatches directly, no LLM call.
     if parse_selection(text).get("action") or stage not in _CARD_STAGES:
+        ctx.logger.info(
+            f"[dispatch] fast-path to {_stage_handler(stage).__name__} | "
+            f"stage={stage!r} has_trip={bool(state.get('trip'))} "
+            f"has_itineraries={bool((state.get('last_itineraries') or {}).get('itineraries'))} "
+            f"text={text[:60]!r}"
+        )
         await _stage_handler(stage)(ctx, sender, text, state)
         return
 
@@ -798,6 +866,7 @@ async def _dispatch_paid(ctx: Context, sender: str, text: str, state: dict[str, 
 
     state["message_history"] = result.history_json  # persist so follow-ups keep context
     save_state(ctx, sender, state)
+    ctx.logger.info(f"[dispatch] classifier at stage={stage!r} -> {result.intent!r}")
 
     if result.intent == "escalate":
         await _handle_escalate(ctx, sender, text, state)
@@ -813,7 +882,19 @@ async def _dispatch_paid(ctx: Context, sender: str, text: str, state: dict[str, 
 
 
 async def _handle_override(ctx: Context, sender: str, text: str, state: dict[str, Any]) -> None:
-    """A restated/different trip mid-flow: drop trip state, keep paid, re-intake."""
+    selection = parse_selection(text)
+    if not selection.get("action"):
+        extraction = await extract_trip(text)
+        if not extraction.origin and not extraction.destination:
+            await _resend_current_card(
+                ctx,
+                sender,
+                state,
+                "I didn't catch a new starting point or destination there - "
+                "here's where we left off. Ask me anything, or tell me both "
+                "ends of a trip to change it.",
+            )
+            return
     clear_trip_state(state)
     state["stage"] = INTAKE
     save_state(ctx, sender, state)
@@ -825,7 +906,7 @@ async def _handle_accept_default(ctx: Context, sender: str, state: dict[str, Any
     of making the user evaluate it themselves (ux-diagnosis.md issue E).
 
     Each stage already has a sensible default computed server-side - the
-    cheapest fare (``_show_detail``), the fastest route (badge-eligible in
+    default fare (``_show_detail``), the fastest route (badge-eligible in
     ``route_carousel_card``) - this just acts on it via the same selection
     shape a tap would send, so it goes through the exact same code path as a
     real card interaction.
@@ -850,7 +931,7 @@ async def _handle_accept_default(ctx: Context, sender: str, state: dict[str, Any
         await start_intake(ctx, sender, state)
 
 
-# ── Protocol handlers ────────────────────────────────────────────────────────
+# Protocol handlers 
 @chat_proto.on_message(ChatMessage)
 async def handle_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
     await ctx.send(
@@ -860,14 +941,13 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
         ),
     )
 
-    # A brand-new conversation window always starts unpaid (per chat-window
-    # unlock) - reset_on_new_window wipes state and tells us to gate below.
     is_new_window = reset_on_new_window(ctx, sender, msg)
-    state = get_state(ctx, sender)
-
     if is_new_window:
-        await request_payment(ctx, sender, state)
+        await clear_watch(ctx, sender)
+        await request_payment(ctx, sender, get_state(ctx, sender))
         return
+
+    state = get_state(ctx, sender)
 
     has_text = any(isinstance(c, TextContent) for c in msg.content)
     if not has_text:
@@ -878,7 +958,7 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
         return
 
     if not state["paid"]:
-        await _handle_unpaid(ctx, sender, text, state)
+        await _handle_unpaid(ctx, sender, text)
     else:
         await _dispatch_paid(ctx, sender, text, state)
 

@@ -31,8 +31,19 @@ CACHE_DIR = Path(os.getenv("FIVE11_CACHE_DIR", ".cache"))
 _ZIP_PATH = CACHE_DIR / "gtfs_regional.zip"
 _ZIP_TTL_S = float(os.getenv("FIVE11_GTFS_TTL_S", str(24 * 3600)))
 
-CLIPPER_MEDIA = ("clipper", "contactless", "munimobile", "ezfare", "tokentransit")
-CASH_MEDIA = ("cash", "ticket")
+# The two payment methods this agent models, and the only two that matter for an
+# adult single ride since the region-wide Clipper 2.0 / "Tap and Ride" rollout
+# (10 Dec 2025): every Clipper agency now takes a contactless bank card or mobile
+# wallet at the gate as well as a Clipper card. They share one media group because
+# they cost the same - verified against this feed, where every network's adult
+# single-ride amount is identical under `clipper` and `contactless`. The feed does
+# still lag on transfer discounts (146 transfer rules list a Clipper product with
+# no contactless twin), which is why pricing reads the group as a whole rather
+# than each medium in isolation; MTC publishes the transfer discount as applying
+# to bank cards too. Agency-app media (munimobile/ezfare/tokentransit) are left
+# out: they are neither payment method offered, and no network's price depends on
+# them. Cash is deliberately absent - see `fares.compute_fare_options`.
+TAP_MEDIA = ("clipper", "contactless")
 
 _PASS_MARKERS = ("day", "month", "week", "passport", "-day", "1-month", "31-day")
 

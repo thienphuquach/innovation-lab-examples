@@ -47,9 +47,19 @@ class FakeContext:
     def __init__(self, session: str = "window-1") -> None:
         self.storage = FakeStorage()
         self.agent = _FakeAgent()
-        self.session = session
+        self._session = session
         self.logger = _FakeLogger()
         self.sent: list[tuple[str, Any]] = []
+
+    # Mirrors the real Context, where ``session`` is a read-only view of the
+    # private field that message dispatch actually stamps onto the envelope.
+    @property
+    def session(self) -> Any:
+        return self._session
+
+    @session.setter
+    def session(self, value: Any) -> None:
+        self._session = value
 
     async def send(self, destination: str, message: Any) -> None:
         self.sent.append((destination, message))

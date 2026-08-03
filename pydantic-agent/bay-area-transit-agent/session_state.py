@@ -41,7 +41,11 @@ def default_state() -> dict[str, Any]:
         "paid": False,
         "paid_at": None,  # ISO timestamp once paid
         "stage": UNINITIALIZED,
-        "message_history": None,  # ModelMessagesTypeAdapter.dump_json string
+        "message_history": None,  # ModelMessagesTypeAdapter.dump_json string - the
+        # cross-cutting interrupt classifier's (_intent_agent) own conversation, kept
+        # separate from finalize_history below since they're different Pydantic AI
+        # agents with unrelated tool schemas - see research-notes.md.
+        "finalize_history": None,  # Stage 5 deferred-tool (_finalize_agent) history
         "trip": None,  # normalized TripRequest dict (Stage 2), fully geocoded
         "pending_trip": None,  # trip mid-geocoding (Stage 2.5), coords being resolved
         "geocode_alternates": None,  # {"origin"/"destination": [candidate dicts]} - the
@@ -91,6 +95,7 @@ def clear_trip_state(state: dict[str, Any]) -> None:
     state["fare_notes"] = None
     state["selected_fare_option"] = None
     state["pending_approval"] = None
+    state["finalize_history"] = None
 
 
 def reset_on_new_window(ctx: Context, sender: str, msg: "ChatMessage") -> bool:

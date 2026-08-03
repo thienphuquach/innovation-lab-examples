@@ -8,10 +8,16 @@ import json
 
 from cards import (
     _leg_step_items,
+    _requires_tap_off,
     _short_label,
     disambiguation_carousel_card,
+    fare_narration_lines,
+    final_itinerary_card,
+    intake_form_card,
+    no_fare_labels,
     no_routes_recovery_card,
     route_carousel_card,
+    route_detail_card,
     route_title,
     route_walkthrough_card,
 )
@@ -135,6 +141,133 @@ def test_leg_step_items_lead_with_plain_language_and_keep_the_route_code():
     assert badge["label"] == "Yellow-N"  # the actual route code, kept for boarding time
 
 
+# ── Clipper guidance: tap-on/tap-off policy varies by agency, not by leg cost ─
+def test_distance_priced_agencies_require_tap_off():
+    """BART, Caltrain and Golden Gate Transit charge by distance/zone, so a
+    second tap at exit is how the correct (lower) fare gets applied - confirmed
+    against Clipper's own rider FAQ and each agency's fare guide."""
+    assert _requires_tap_off({"agencyName": "Bay Area Rapid Transit"})
+    assert _requires_tap_off({"agencyName": "Golden Gate Transit"})
+    assert not _requires_tap_off({"agencyName": "San Francisco Municipal Transportation Agency"})
+    assert not _requires_tap_off({"agencyName": "AC TRANSIT"})
+
+
+def test_golden_gate_ferry_is_single_tap_unlike_the_bus():
+    """Same district, different brand, different policy - the ferry must not
+    match on a bare "golden gate" substring."""
+    assert not _requires_tap_off({"agencyName": "Golden Gate Ferry"})
+
+
+def test_leg_step_items_flag_tap_off_only_for_distance_priced_legs():
+    bart_leg = {
+        "mode": "RAIL", "transitLeg": True, "routeShortName": "R",
+        "agencyName": "Bay Area Rapid Transit",
+        "from": {"name": "A"}, "to": {"name": "B"}, "startTime": 0, "endTime": 900000,
+    }
+    muni_leg = {
+        "mode": "BUS", "transitLeg": True, "routeShortName": "49",
+        "agencyName": "San Francisco Municipal Transportation Agency",
+        "from": {"name": "B"}, "to": {"name": "C"}, "startTime": 900000, "endTime": 1800000,
+    }
+    bart_item, muni_item = _leg_step_items({"legs": [bart_leg, muni_leg]})
+    assert any("Tap off" in c["value"] for c in bart_item["children"] if c["type"] == "text")
+    assert not any("Tap off" in c["value"] for c in muni_item["children"] if c["type"] == "text")
+
+
+def test_route_detail_card_carries_no_tap_off_or_clipper_rows():
+    """This detail/copy now lives in the narration text (chat_proto._show_detail),
+    not the card - a link plus a full sentence wraps across several lines inside
+    a table cell, which reads as a wall of text within the card itself."""
+    itinerary = {
+        "legs": [
+            {
+                "mode": "RAIL", "transitLeg": True, "routeShortName": "R",
+                "agencyName": "Bay Area Rapid Transit",
+                "from": {"name": "A"}, "to": {"name": "B"}, "startTime": 0, "endTime": 900000,
+            },
+        ]
+    }
+    choices = [{"value": "clipper", "label": "Clipper card", "secondary_text": "$5.00"}]
+    payload = json.loads(route_detail_card(itinerary, choices)["card_payload"])
+    labels = {r["label"] for r in payload["summary_rows"]}
+    assert "Tap off at" not in labels
+    assert "New to Clipper?" not in labels
+
+
+def test_fare_narration_lines_names_only_the_agencies_that_actually_need_a_tap_off():
+    """Each fact is its own short, standalone sentence - specific to this
+    itinerary's own legs, not a generic disclaimer the rider has to map onto
+    their own trip."""
+    itinerary = {
+        "legs": [
+            {
+                "mode": "RAIL", "transitLeg": True, "routeShortName": "R",
+                "agencyName": "Bay Area Rapid Transit",
+                "from": {"name": "A"}, "to": {"name": "B"}, "startTime": 0, "endTime": 900000,
+            },
+            {
+                "mode": "BUS", "transitLeg": True, "routeShortName": "49",
+                "agencyName": "San Francisco Municipal Transportation Agency",
+                "from": {"name": "B"}, "to": {"name": "C"}, "startTime": 900000, "endTime": 1800000,
+            },
+        ]
+    }
+    choices = [{"value": "clipper", "label": "Clipper card", "secondary_text": "$5.00"}]
+    lines = fare_narration_lines(itinerary, choices)
+
+    tap_off_line = next(line for line in lines if "tap off" in line.lower())
+    assert "BART" in tap_off_line
+    assert "Muni" not in tap_off_line
+    # "Not required" and the get-a-card link are two standalone facts, not one
+    # blob - each is its own short sentence rather than a paragraph.
+    assert any("Not required" in line for line in lines)
+    assert any("clippercard.com/get" in line for line in lines)
+    assert all(len(line) < 120 for line in lines)
+
+
+def test_fare_narration_lines_has_no_tap_off_line_when_nothing_requires_it():
+    itinerary = {
+        "legs": [
+            {
+                "mode": "BUS", "transitLeg": True, "routeShortName": "49",
+                "agencyName": "San Francisco Municipal Transportation Agency",
+                "from": {"name": "A"}, "to": {"name": "B"}, "startTime": 0, "endTime": 900000,
+            },
+        ]
+    }
+    choices = [{"value": "clipper", "label": "Clipper card", "secondary_text": "$2.50"}]
+    lines = fare_narration_lines(itinerary, choices)
+    assert not any("Tap off" in line for line in lines)
+    assert any("Clipper" in line for line in lines)
+
+
+def test_fare_narration_lines_has_no_clipper_line_when_no_fare_choices():
+    itinerary = {"legs": []}
+    assert fare_narration_lines(itinerary, []) == []
+
+
+# ── Issue: alerts seen at Stage 4 must not silently vanish by confirm time ────
+def test_final_itinerary_card_carries_alerts_forward():
+    itinerary = {
+        "legs": [
+            {
+                "mode": "RAIL", "transitLeg": True, "routeShortName": "R", "agencyName": "BART",
+                "from": {"name": "A"}, "to": {"name": "B"}, "startTime": 0, "endTime": 900000,
+            },
+        ]
+    }
+    meta = final_itinerary_card(itinerary, "Clipper card", "$2.50", alerts=["Delay on Line 1"])
+    payload = json.loads(meta["card_payload"])
+    kinds = [child["type"] for child in payload["root"]["children"]]
+    assert "badge" in kinds  # the carried-forward alert, not just dropped
+
+
+def test_final_itinerary_card_alerts_default_to_none_without_error():
+    itinerary = {"legs": []}
+    meta = final_itinerary_card(itinerary, None, None)
+    assert json.loads(meta["card_payload"])["root"]["title"]
+
+
 def test_route_walkthrough_card_is_a_terminal_custom_list_sequence():
     """The walkthrough is its own card, sent separately from the fare/confirm
     decision (issue B: sequence content shouldn't share a flat row list with a
@@ -163,6 +296,25 @@ def test_route_walkthrough_card_is_a_terminal_custom_list_sequence():
 def test_no_routes_recovery_card_names_the_trip_and_offers_next_steps():
     payload = json.loads(no_routes_recovery_card("Berkeley", "Powell St")["card_payload"])
     values = {row["label"]: row["value"] for row in payload["summary_rows"]}
-    assert values == {"From": "Berkeley", "To": "Powell St"}
+    assert values["From"] == "Berkeley"
+    assert values["To"] == "Powell St"
     actions = {cta["selection"]["action"] for cta in payload["ctas"]}
-    assert actions == {"retry_later", "new_trip"}
+    assert actions == {"new_trip"}
+
+
+# ── Every search departs now: no depart-time input anywhere ──────────────────
+def test_intake_form_collects_only_origin_destination_and_priority():
+    payload = json.loads(intake_form_card()["card_payload"])
+    assert [f["name"] for f in payload["fields"]] == ["origin", "destination", "priority"]
+
+
+def test_no_fare_labels_never_calls_a_transit_trip_free():
+    """Cash is no longer modelled, so an unpriceable transit trip is a real case -
+    it must not inherit the walking-only "free" label."""
+    walk_only = {"legs": [{"mode": "WALK", "transitLeg": False}]}
+    assert no_fare_labels(walk_only) == ("Walking - free", "$0.00")
+
+    has_transit = {"legs": [{"mode": "RAIL", "transitLeg": True, "routeId": "AM:CC"}]}
+    how_to_pay, total = no_fare_labels(has_transit)
+    assert "free" not in how_to_pay.lower()
+    assert total != "$0.00"

@@ -1,17 +1,6 @@
-"""uAgent entry point for the Bay Area Transit & Fare Concierge.
-
-Wires the ASI:One Agent Chat Protocol (the trip-planning state machine) and the
-Agent Payment Protocol (the Stripe unlock gate) into a single uAgent. On startup
-it refuses to run unless the Stripe keys are test keys - this agent never touches
-a live Stripe account.
-"""
-
 from __future__ import annotations
-
 import os
-
 from dotenv import load_dotenv
-
 load_dotenv()
 
 from uagents import Agent, Context  # noqa: E402
@@ -27,17 +16,13 @@ agent = Agent(
     mailbox=True,
     publish_agent_details=True,
     description=(
-        "Plan a multi-modal Bay Area transit trip and see the cheapest way to pay "
-        "for it (Clipper vs. cash vs. day pass). A one-time $5 Stripe unlock is "
-        "required before any trip planning - test mode only, no real charge."
+        "Plan a multi-modal Bay Area transit trip and see what it costs to tap "
+        "through (Clipper card or contactless bank card). A one-time $5 Stripe "
+        "unlock is required before any trip planning - test mode only, no real charge."
     ),
     readme_path=os.path.join(os.path.dirname(__file__), "README.md"),
 )
 
-# ``ctx.storage`` persists to a JSON file across restarts. For an example agent,
-# each fresh ``python agent.py`` run should behave like a brand-new demo (pay
-# again from message one). Default true; set to "false" to keep state across
-# restarts if you want to test persistence deliberately.
 _RESET_STORAGE_ON_START = (os.getenv("RESET_STORAGE_ON_START", "true").strip().lower()) not in {
     "0",
     "false",
@@ -61,6 +46,17 @@ async def startup(ctx: Context) -> None:
         f"[agent] Inspector: https://agentverse.ai/inspect/"
         f"?uri=http://127.0.0.1:{port}&address={agent.address}"
     )
+
+
+@agent.on_interval(period=float(os.getenv("STRIPE_POLL_SECONDS", "3")))
+async def watch_stripe(ctx: Context) -> None:
+    """Unlock a sender as soon as Stripe settles, without waiting for them to speak.
+
+    ASI:One does not reliably send ``CommitPayment`` after its native card's
+    "Confirm Payment", so this is what makes the trip form appear on its own the
+    moment the checkout is paid.
+    """
+    await payment.poll_pending(ctx)
 
 
 agent.include(chat_proto, publish_manifest=True)

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import pytest
 from uagents_core.contrib.protocols.chat import ChatMessage, MetadataContent
 
 import chat_proto
+import clients.transitland as transitland
 from cards import route_carousel_card
 from clients.transitland import RoutingError
+from models import BAY_AREA_TZ
 from session_state import INTAKE, SHOWING_DETAIL, SHOWING_ROUTES, get_state
 
 pytestmark = pytest.mark.asyncio
@@ -52,7 +55,6 @@ def _routes_state(ctx, sender):
         "origin_coords": [37.87, -122.27],
         "destination_text": "Powell St",
         "destination_coords": [37.78, -122.41],
-        "depart_time": None,
         "priority": "fastest",
     }
     return state
@@ -69,7 +71,7 @@ def _cards(ctx, kind=None):
 
 
 async def test_search_routes_renders_carousel_and_caches(ctx, sender, monkeypatch):
-    async def fake_plan(o, d, t, **k):
+    async def fake_plan(o, d, **k):
         return _fake_plan()
 
     monkeypatch.setattr(chat_proto, "plan", fake_plan)
@@ -83,7 +85,7 @@ async def test_search_routes_renders_carousel_and_caches(ctx, sender, monkeypatc
 
 
 async def test_routing_error_shows_error_card(ctx, sender, monkeypatch):
-    async def boom(o, d, t, **k):
+    async def boom(o, d, **k):
         raise RoutingError("timeout")
 
     monkeypatch.setattr(chat_proto, "plan", boom)
@@ -97,7 +99,7 @@ async def test_routing_error_shows_error_card(ctx, sender, monkeypatch):
 
 
 async def test_zero_itineraries_shows_specific_recovery_card(ctx, sender, monkeypatch):
-    async def empty(o, d, t, **k):
+    async def empty(o, d, **k):
         return {"itineraries": []}
 
     monkeypatch.setattr(chat_proto, "plan", empty)
@@ -112,8 +114,10 @@ async def test_zero_itineraries_shows_specific_recovery_card(ctx, sender, monkey
     values = {row["label"]: row["value"] for row in payload["summary_rows"]}
     assert values["From"] == "Berkeley"
     assert values["To"] == "Powell St"
+    # Every search departs now, so re-running the identical query can only return
+    # the identical empty result - changing an endpoint is the only real next step.
     actions = {cta["selection"]["action"] for cta in payload["ctas"]}
-    assert actions == {"retry_later", "new_trip"}
+    assert actions == {"new_trip"}
     # No blank form is auto-shown; the trip context is preserved for those CTAs.
     assert not _cards(ctx, "form")
     saved = get_state(ctx, sender)
@@ -135,7 +139,7 @@ async def test_zero_itineraries_retries_alternate_geocode_candidate(ctx, sender,
 
     calls = []
 
-    async def flaky_plan(o, d, t, **k):
+    async def flaky_plan(o, d, **k):
         calls.append((tuple(o), tuple(d)))
         if tuple(d) == (37.9, -122.5):
             return _fake_plan()
@@ -151,18 +155,38 @@ async def test_zero_itineraries_retries_alternate_geocode_candidate(ctx, sender,
     assert saved["trip"]["destination_text"] == "A working alternate"
 
 
-async def test_retry_later_action_pushes_depart_time_and_researches(ctx, sender, monkeypatch):
-    state = _routes_state(ctx, sender)
-    state["stage"] = INTAKE  # as left by the no-routes recovery card
+async def test_plan_always_departs_now(monkeypatch):
+    """A search departs at the moment it runs - there is no caller-chosen time."""
+    fixed = datetime(2026, 7, 29, 14, 37, 0, tzinfo=BAY_AREA_TZ)
+    monkeypatch.setattr(transitland, "now_local", lambda: fixed)
+    monkeypatch.setenv("Transitland_Routing_API", "test-key")
+    transitland._cache.clear()
 
-    async def fake_plan(o, d, t, **k):
-        return _fake_plan()
+    sent_params: dict[str, str] = {}
 
-    monkeypatch.setattr(chat_proto, "plan", fake_plan)
-    await chat_proto._handle_intake(ctx, sender, json.dumps({"action": "retry_later"}), state)
+    class _Resp:
+        def raise_for_status(self):
+            pass
 
-    assert _cards(ctx, "carousel")
-    assert get_state(ctx, sender)["trip"] is not None  # trip context kept, not wiped
+        def json(self):
+            return {"plan": {"itineraries": []}}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, params=None):
+            sent_params.update(params or {})
+            return _Resp()
+
+    monkeypatch.setattr(transitland.httpx, "AsyncClient", lambda **kw: _Client())
+    await transitland.plan([37.87, -122.27], [37.78, -122.41])
+
+    assert sent_params["date"] == "2026-07-29"
+    assert sent_params["time"] == "14:37:00"
 
 
 async def test_new_trip_action_clears_state_and_shows_blank_form(ctx, sender):
@@ -175,7 +199,7 @@ async def test_new_trip_action_clears_state_and_shows_blank_form(ctx, sender):
 
 
 async def test_pick_route_advances_to_detail(ctx, sender, monkeypatch):
-    async def fake_plan(o, d, t, **k):
+    async def fake_plan(o, d, **k):
         return _fake_plan()
 
     async def fake_alerts(route_ids, agency_ids):

@@ -4,6 +4,9 @@ Schedule-only multi-modal itineraries. Coordinates are sent as **lat,lon** (the
 docs' table mislabels this as "lon,lat" but the example value and the response
 ``from``/``to`` objects are lat,lon - see ``research-notes.md`` §7).
 
+Every search departs **now**: the moment a route search runs is the moment the
+rider means, so there is no caller-supplied departure time.
+
 Responses are cached by ``(origin, destination, 5-minute time bucket)`` for a few
 minutes so a repeated or "Back" query never spends against the 1,000/month free
 budget (the cache is also what makes Stage 4's "Back" free).
@@ -13,12 +16,12 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import datetime
 from typing import Any
 
 import httpx
 
-from models import BAY_AREA_TZ, now_local
-from datetime import datetime
+from models import now_local
 
 ROUTING_URL = "https://transit.land/api/v2/routing/otp/plan"
 
@@ -37,18 +40,6 @@ def _api_key() -> str:
     return key
 
 
-def _depart_datetime(depart_iso: str | None) -> datetime:
-    if not depart_iso:
-        return now_local()
-    try:
-        dt = datetime.fromisoformat(depart_iso)
-    except ValueError:
-        return now_local()
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=BAY_AREA_TZ)
-    return dt.astimezone(BAY_AREA_TZ)
-
-
 def _cache_key(origin: list[float], dest: list[float], dt: datetime) -> str:
     bucket = dt.strftime("%Y-%m-%d %H:") + str((dt.minute // 5) * 5)
     return (
@@ -60,16 +51,17 @@ def _cache_key(origin: list[float], dest: list[float], dt: datetime) -> str:
 async def plan(
     origin_coords: list[float],
     dest_coords: list[float],
-    depart_iso: str | None,
     *,
     max_itineraries: int = 6,
 ) -> dict[str, Any]:
     """Return the raw Transitland ``plan`` object (``{itineraries: [...], ...}``).
 
+    Departs at the current Bay Area time, evaluated here rather than by the
+    caller, so a search always reflects the moment it actually runs.
     ``origin_coords``/``dest_coords`` are ``[lat, lon]``. Raises :class:`RoutingError`
     on network/API failure so the caller can surface an apologetic card.
     """
-    dt = _depart_datetime(depart_iso)
+    dt = now_local()
     key = _cache_key(origin_coords, dest_coords, dt)
     cached = _cache.get(key)
     if cached and (time.monotonic() - cached[0]) < _CACHE_TTL_S:

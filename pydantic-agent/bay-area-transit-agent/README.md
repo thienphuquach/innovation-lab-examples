@@ -1,8 +1,9 @@
 # Bay Area Transit & Fare Concierge
 
 A payment-gated Fetch.ai uAgent, reachable through ASI:One, that plans multi-modal
-San Francisco Bay Area trips (walk + bus + train) and computes the cheapest way to
-pay for each one — Clipper vs. cash vs. day pass — from live schedule and fare data.
+San Francisco Bay Area trips (walk + bus + train) and computes what each one costs
+to tap through — with a Clipper card or a contactless bank card — from live schedule
+and fare data.
 
 Everything happens inside ASI:One chat: the agent talks through **interactive
 cards** and plain **free-text chat**, interchangeably. A single one-time Stripe
@@ -28,11 +29,11 @@ several of the behaviors below.
 | Stage | What happens | Surface |
 |---|---|---|
 | 0 — Payment gate | Any message from an unpaid sender gets a Stripe checkout and nothing else | Payment Protocol (native Stripe UI) |
-| 1 — Verification | `CommitPayment` → verify `payment_status == "paid"` with retries → unlock | Payment Protocol (`seller`) |
-| 2 — Intake | Collect origin / destination / depart time / priority | `form` card **or** free text |
+| 1 — Verification | `CommitPayment` *or* a Stripe poll showing `payment_status == "paid"` → unlock | Payment Protocol (`seller`) |
+| 2 — Intake | Collect origin / destination / priority. There is no depart-time input: every search departs at the moment it runs | `form` card **or** free text |
 | 2.5 — Geocoding | Resolve text to coordinates (Transitland stops → Nominatim fallback) | `carousel` for disambiguation |
 | 3 — Routes | Transitland itineraries, titled in plain language (e.g. "BART train", not a line-color code) with Fastest / Fewest-transfers / Long-wait badges | `carousel` |
-| 4 — Route + fares | Sent as **two** cards: a step-by-step walkthrough (board/alight/direction per leg + live 511 GTFS-RT alerts) *before* the payment decision, so the clearest explanation lands while the user is still deciding whether to proceed - then the fare-by-payment-method choice itself | `custom` list card, then a `detail` card |
+| 4 — Route + fares | Sent as **two** cards: a step-by-step walkthrough (board/alight/direction per leg + live 511 GTFS-RT alerts) *before* the payment decision, so the clearest explanation lands while the user is still deciding whether to proceed - then the payment choice itself, Clipper card or contactless bank card (same fare either way, since Clipper 2.0) | `custom` list card, then a `detail` card |
 | 5 — Review & confirm | A Pydantic AI `requires_approval=True` deferred tool gates the finalize step; the confirmation recaps the same walkthrough, plus a self-hosted map image (leg-coloured, with distinct start/transfer/end markers, a plain-language colour legend, and a free "open in Google Maps" link for a live view) | `review` card, then a terminal `custom` card + image |
 | 6 — Repeat use | A finished session keeps the paid unlock and re-enters intake on the next message | — |
 | Cross-cutting | An interrupt classifier lets a user type past any card at any stage (override / escalate / side-question / clarify / accept_default - "just pick for me") | — |
@@ -89,10 +90,13 @@ again from message one) unless you set `RESET_STORAGE_ON_START=false`.
    CVC, any ZIP. (More test cards: https://docs.stripe.com/testing.)
 3. On success the agent unlocks and immediately sends the trip-intake form. From
    there, either fill the form or just type a trip like
-   *"Berkeley to the Mission at 6pm, cheapest."*
+   *"Berkeley to the Mission, cheapest."*
 
-If the automatic `CommitPayment` is slow to arrive, typing `paid` nudges the agent
-to re-check Stripe.
+ASI:One's "Confirm Payment" does not reliably produce a `CommitPayment`, so the
+agent does not depend on one: it polls Stripe every `STRIPE_POLL_SECONDS` for any
+outstanding checkout and unlocks the moment the charge settles. Sending any
+further message also forces an immediate re-check, so a paid user can never stay
+locked out.
 
 ## Running the tests
 
@@ -106,9 +110,9 @@ clients are monkeypatched, and `ctx` is an in-memory fake. Coverage spans the
 payment gate, intake + geocoding (resolved / ambiguous / not-found), the routing
 carousel (including the zero-route recovery + alternate-geocode retry), card
 label/instruction builders (including the plain-language route titles and the
-walkthrough list-sequence card), the fare engine (Clipper transfer discounts, day
-passes, estimated zone fares, partial pricing with explicit unsupported-method
-notes), the `requires_approval` finalize gate (defer / approve / deny), the trip
+walkthrough list-sequence card), the fare engine (transfer discounts, estimated
+zone fares, partial pricing, and the explicit note when an operator can't be tapped
+through at all), the `requires_approval` finalize gate (defer / approve / deny), the trip
 map image (polyline decode, the colour legend/Google-Maps-link builders, and
 best-effort render/upload failure handling), and the interrupt classifier
 (fast-path + all five intents, including `accept_default`, + graceful degradation).
@@ -121,7 +125,7 @@ chat_proto.py       Session/stage dispatcher + interrupt classifier wiring
 payment.py          Agent Payment Protocol seller role + Stripe checkout/verify
 ai.py               Pydantic AI: trip extraction, intent classifier, finalize gate
 cards.py            Interactive-card builders + shared send/parse helpers
-fares.py            GTFS-Fares v2 fare engine (per payment method)
+fares.py            GTFS-Fares v2 fare engine (Clipper / contactless bank card)
 map_image.py        Confirmed-trip map image + colour legend + Google Maps link
 models.py           Trip models + time/format helpers
 session_state.py    Per-sender session schema in ctx.storage

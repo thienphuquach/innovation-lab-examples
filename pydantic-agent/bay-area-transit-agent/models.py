@@ -8,7 +8,7 @@ in ``ctx.storage``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -62,32 +62,17 @@ def epoch_ms_to_clock(ms: int | float | None) -> str:
     return datetime.fromtimestamp(ms / 1000, BAY_AREA_TZ).strftime("%H:%M")
 
 
-def depart_option_to_iso(option: str | None, *, now: datetime | None = None) -> str | None:
-    """Map a form ``depart_option`` to an absolute ISO local timestamp.
+def new_trip(*, origin_text: str, destination_text: str, priority: str) -> dict[str, Any]:
+    """Build the normalized ``trip`` dict (coords filled in during geocoding).
 
-    Returns ``None`` for the "pick a time" option (the caller must then ask the
-    user to type a time) and for an unrecognized value.
+    There is no departure time: a search always departs at the moment it runs
+    (see :func:`clients.transitland.plan`).
     """
-    now = now or now_local()
-    if option in (None, "", "now"):
-        return now.isoformat()
-    if option == "15":
-        return (now + timedelta(minutes=15)).isoformat()
-    if option == "30":
-        return (now + timedelta(minutes=30)).isoformat()
-    return None  # "custom" / unknown -> caller prompts for a time
-
-
-def new_trip(
-    *, origin_text: str, destination_text: str, depart_time: str | None, priority: str
-) -> dict[str, Any]:
-    """Build the normalized ``trip`` dict (coords filled in during geocoding)."""
     return {
         "origin_text": origin_text.strip(),
         "origin_coords": None,
         "destination_text": destination_text.strip(),
         "destination_coords": None,
-        "depart_time": depart_time,
         "priority": priority if priority in PRIORITIES else "fastest",
     }
 

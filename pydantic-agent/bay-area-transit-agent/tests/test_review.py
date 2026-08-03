@@ -11,7 +11,11 @@ pytest.importorskip("pydantic_ai")
 from pydantic_ai import ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.function import AgentInfo, FunctionModel
-from uagents_core.contrib.protocols.chat import ChatMessage, MetadataContent
+from uagents_core.contrib.protocols.chat import (
+    ChatMessage,
+    MetadataContent,
+    TextContent,
+)
 
 import chat_proto
 from ai import FinalizeStart, resume_finalize, start_finalize
@@ -63,6 +67,14 @@ def _cards(ctx, kind=None):
             for c in m.content:
                 if isinstance(c, MetadataContent) and (kind is None or c.metadata["card_kind"] == kind):
                     out.append(c.metadata)
+    return out
+
+
+def _texts(ctx):
+    out = []
+    for _, m in ctx.sent:
+        if isinstance(m, ChatMessage):
+            out += [c.text for c in m.content if isinstance(c, TextContent)]
     return out
 
 
@@ -122,12 +134,22 @@ async def test_confirm_finalizes_and_enters_done(ctx, sender, monkeypatch):
     state = _detail_state(ctx, sender)
     state["stage"] = AWAITING_CONFIRM
     state["pending_approval"] = {"tool_call_id": "t1"}
-    state["message_history"] = "[]"
+    state["finalize_history"] = "[]"
+    state["alerts"] = ["Delays on Line 1"]  # carried forward from Stage 4
 
     await chat_proto._handle_confirm(ctx, sender, json.dumps({"action": "confirm"}), state)
 
     metas = _cards(ctx, "custom")  # final_itinerary_card is now a custom list-sequence card
     assert metas and metas[0].get("is_terminal") == "true"
+    payload = json.loads(metas[0]["card_payload"])
+    badges = [c["label"] for c in payload["root"]["children"] if c["type"] == "badge"]
+    assert any("Delays on Line 1" in b for b in badges)  # the alert must not vanish by confirm time
+
+    # The narration itself must stand alone (cards.py's self-containment rule) -
+    # not a bare "you're all set" that means nothing if the card fails to render.
+    narration = _texts(ctx)[-1]
+    assert "Clipper" in narration and "$3.25" in narration
+
     saved = get_state(ctx, sender)
     assert saved["stage"] == DONE
     assert saved["trip"] is None  # trip state cleared for the next request
@@ -144,7 +166,7 @@ async def test_cancel_returns_to_intake_form(ctx, sender, monkeypatch):
     state = _detail_state(ctx, sender)
     state["stage"] = AWAITING_CONFIRM
     state["pending_approval"] = {"tool_call_id": "t1"}
-    state["message_history"] = "[]"
+    state["finalize_history"] = "[]"
 
     await chat_proto._handle_confirm(ctx, sender, json.dumps({"action": "cancel"}), state)
 
