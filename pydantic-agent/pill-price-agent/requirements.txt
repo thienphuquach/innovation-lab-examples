@@ -1,0 +1,30 @@
+# Fetch.ai agent framework + ASI:One chat protocol (pins match shipping-label-agent)
+uagents==0.23.6
+uagents-core==0.4.0
+
+# Pydantic AI - structured output, dependency injection, requires_approval gating
+pydantic-ai>=2.0.0
+pydantic>=2.7.0
+
+# pydantic-graph supplies BaseNode/GraphRunContext for the conversation machine.
+# v2 removed the persistence package; this agent stores state in ctx.storage and
+# only needs the typed node primitives, which are not deprecated.
+pydantic-graph>=2.0.0
+
+# ASI:One is reached through Pydantic AI's OpenAI-compatible model
+openai>=1.40.0
+
+# Stripe test-mode Checkout - the paid-tier gate
+stripe>=8.0.0
+
+# NADAC CSV download + openFDA REST calls
+httpx>=0.27.0
+
+# Utilities
+python-dotenv>=1.0.0
+
+# Dev / CI (ruff, mypy, pytest)
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
+ruff>=0.8.0
+mypy>=1.11.0

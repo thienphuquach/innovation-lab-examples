@@ -1,0 +1,8 @@
+# The NADAC cache is rebuilt from CMS on first run; never commit the 23 MB file.
+nadac_cache.sqlite3
+*.sqlite3
+
+# uAgent ctx.storage
+*_data.json
+
+.ruff_cache/
